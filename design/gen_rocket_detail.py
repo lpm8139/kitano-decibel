@@ -38,8 +38,12 @@ def ranking(highlight=None, title="きょうの ランキング", sub="とどい
 <div style="position:absolute;left:40px;right:40px;bottom:44px;padding:16px;border-radius:20px;background:rgba(255,255,255,0.08);font-size:24px;color:#D7DBFF;text-align:center">チャンピオンの ロケットが<br>「かげ」に なって いっしょに とぶよ</div></div>'''
 
 # 高度トラック（縦）: marks = [(名前, km, 種別)]  pos 0..1
-def track(marks, you, ghost, x=90, top=110, h=900, w=380):
-    out = f'<div style="position:absolute;left:{x}px;top:{top}px;width:{w}px;height:{h}px;border-radius:40px;background:linear-gradient(180deg,rgba(255,255,255,0.10),rgba(255,255,255,0.03));border:3px solid rgba(255,255,255,0.18)"></div>'
+def track(marks, you, ghost, x=90, top=110, h=900, w=380, earth=False, psize=300):
+    out = earth_horizon() if earth else ""
+    for name, km, kind, pos in marks:
+        if name in PLANET:
+            out += peek(PLANET[name], top + h - 60 - (h - 120) * pos, psize)
+    out += f'<div style="position:absolute;left:{x}px;top:{top}px;width:{w}px;height:{h}px;border-radius:40px;background:linear-gradient(180deg,rgba(255,255,255,0.07),rgba(255,255,255,0.02));border:3px solid rgba(255,255,255,0.18)"></div>'
     for name, km, kind, pos in marks:
         y = top + h - 60 - (h - 120) * pos
         if kind == "goal":
@@ -69,6 +73,37 @@ def db_box(x, y, db, w=560, label="いまの こえ"):
 def pill(text, bgc, color="#fff", size=40):
     return f'<span style="display:inline-block;padding:12px 34px;border-radius:999px;background:{bgc};color:{color};font-size:{size}px;font-weight:900;white-space:nowrap">{text}</span>'
 
+
+# ---- 星（簡易イラスト）。画面の左端から半分だけのぞかせる ----
+def planet_svg(kind, d):
+    r = d / 2
+    if kind == "moon":
+        body = f'<circle cx="{r}" cy="{r}" r="{r}" fill="#D9DAE6"/><circle cx="{r*0.62}" cy="{r*0.7}" r="{r*0.16}" fill="#B9BACB"/><circle cx="{r*1.25}" cy="{r*1.2}" r="{r*0.22}" fill="#B9BACB"/><circle cx="{r*1.3}" cy="{r*0.55}" r="{r*0.1}" fill="#B9BACB"/>'
+        return f'<svg width="{d}" height="{d}" viewBox="0 0 {d} {d}">{body}</svg>'
+    if kind == "mars":
+        body = f'<circle cx="{r}" cy="{r}" r="{r}" fill="#E4572E"/><ellipse cx="{r*0.7}" cy="{r*0.8}" rx="{r*0.3}" ry="{r*0.18}" fill="#B8401F"/><ellipse cx="{r*1.3}" cy="{r*1.35}" rx="{r*0.25}" ry="{r*0.14}" fill="#B8401F"/><ellipse cx="{r}" cy="{r*0.12}" rx="{r*0.35}" ry="{r*0.1}" fill="#FBE3D8"/>'
+        return f'<svg width="{d}" height="{d}" viewBox="0 0 {d} {d}">{body}</svg>'
+    if kind == "jupiter":
+        bands = "".join(f'<rect x="0" y="{r*y0}" width="{d}" height="{r*h}" fill="{c}"/>' for y0, h, c in [(0.35,0.18,"#C98C5A"),(0.7,0.12,"#F3D6A8"),(0.95,0.2,"#B9774A"),(1.32,0.14,"#F3D6A8"),(1.55,0.12,"#C98C5A")])
+        return f'<svg width="{d}" height="{d}" viewBox="0 0 {d} {d}"><defs><clipPath id="jc{d}"><circle cx="{r}" cy="{r}" r="{r}"/></clipPath></defs><circle cx="{r}" cy="{r}" r="{r}" fill="#E0B07A"/><g clip-path="url(#jc{d})">{bands}</g><ellipse cx="{r*1.25}" cy="{r*1.05}" rx="{r*0.2}" ry="{r*0.11}" fill="#D2603A"/></svg>'
+    if kind == "saturn":
+        w = d * 1.7
+        cx = w / 2
+        return f'<svg width="{w}" height="{d}" viewBox="0 0 {w} {d}"><ellipse cx="{cx}" cy="{r}" rx="{w*0.48}" ry="{r*0.3}" fill="none" stroke="#E9D9A6" stroke-width="{d*0.07}"/><circle cx="{cx}" cy="{r}" r="{r*0.82}" fill="#F0D58C"/><rect x="{cx-r}" y="{r*0.75}" width="{d}" height="{r*0.12}" fill="#DDBB6A" opacity=".7"/><path d="M {cx-w*0.48} {r} A {w*0.48} {r*0.3} 0 0 0 {cx+w*0.48} {r}" fill="none" stroke="#E9D9A6" stroke-width="{d*0.07}"/></svg>'
+    if kind == "earth":
+        return f'<svg width="{d}" height="{d}" viewBox="0 0 {d} {d}"><circle cx="{r}" cy="{r}" r="{r}" fill="#3A86FF"/><ellipse cx="{r*0.55}" cy="{r*0.35}" rx="{r*0.28}" ry="{r*0.14}" fill="#4CC38A"/><ellipse cx="{r*1.3}" cy="{r*0.25}" rx="{r*0.22}" ry="{r*0.1}" fill="#4CC38A"/><ellipse cx="{r}" cy="{r*0.12}" rx="{r*0.5}" ry="{r*0.05}" fill="#BFE3FF" opacity=".6"/></svg>'
+    return ""
+
+PLANET = {"つき": "moon", "かせい": "mars", "もくせい": "jupiter", "どせい": "saturn"}
+
+def peek(kind, cy, d, left=None):
+    w = d * 1.7 if kind == "saturn" else d
+    x = -w / 2 if left is None else left
+    return f'<div style="position:absolute;left:{x}px;top:{cy - d/2}px">{planet_svg(kind, d)}</div>'
+
+def earth_horizon():  # ステージ1の足元：地球の丸い地平線
+    return f'<div style="position:absolute;left:-260px;top:930px">{planet_svg("earth", 1100)}</div>'
+
 STAGE_MARKS = [("ちきゅう", "", "mark", 0.0), ("くも", "10km", "mark", 0.14),
                ("うちゅう", "100km", "goal", 0.45), ("つき", "500km", "goal", 0.92)]
 
@@ -80,9 +115,9 @@ def screen(name, inner, style):
 
 S = []
 # 1 待機
-S.append(screen("① 待機中（つぎの人を待っている）", f'''{stars()}
+S.append(screen("① 待機中（つぎの人を待っている）", f'''{stars()}{earth_horizon()}
 <div style="position:absolute;left:90px;top:56px;font-size:64px;font-weight:900;letter-spacing:3px;white-space:nowrap">こえで ロケットを とばそう！</div>
-<div style="position:absolute;left:90px;top:150px;font-size:30px;color:#B9C0FF">5びょうで つきまで とどいたら「エンドレスモード」に とつにゅう！</div>
+<div style="position:absolute;left:90px;top:150px;font-size:30px;color:#B9C0FF">うちゅう → つき に とどいたら、∞エンドレスモードへ！</div>
 <div style="position:absolute;left:150px;top:640px;width:300px;height:60px;border-radius:12px;background:#5A5F8C"></div>
 <div style="position:absolute;left:230px;top:390px">{rocket(scale=1.1)}</div>
 <div style="position:absolute;left:100px;top:700px;width:420px;height:120px;border-radius:999px;background:rgba(255,255,255,0.18)"></div>
@@ -90,7 +125,7 @@ S.append(screen("① 待機中（つぎの人を待っている）", f'''{stars(
   <div style="display:flex;flex-direction:column;gap:22px">
     <div style="padding:22px 30px;border-radius:28px;background:rgba(255,255,255,0.10);font-size:36px;font-weight:900;white-space:nowrap">① マイクの まえに たつ</div>
     <div style="padding:22px 30px;border-radius:28px;background:rgba(255,255,255,0.10);font-size:36px;font-weight:900;white-space:nowrap">② 「わーーーっ！」と こえを だす</div>
-    <div style="padding:22px 30px;border-radius:28px;background:rgba(255,255,255,0.10);font-size:36px;font-weight:900;white-space:nowrap">③ ★うちゅう → ★つき を めざせ！</div>
+    <div style="padding:22px 30px;border-radius:28px;background:rgba(255,255,255,0.10);font-size:36px;font-weight:900;white-space:nowrap">③ ★うちゅう → ★つき → ∞エンドレス！</div>
   </div>
   <div style="margin-top:44px;display:flex;align-items:center;gap:24px"><span style="font-size:30px;color:#B9C0FF">いまの こえ</span>
     <div style="flex:1;height:28px;border-radius:14px;background:rgba(255,255,255,0.15)"><div style="width:38%;height:100%;border-radius:14px;background:{CYAN}"></div></div>
@@ -98,7 +133,7 @@ S.append(screen("① 待機中（つぎの人を待っている）", f'''{stars(
   <div style="margin-top:46px;text-align:center">{pill("こえを だすと スタート！", "#FF5A5F", size=48)}</div>
 </div>{ranking()}''', bg()))
 # 2 ステージ1 計測中
-S.append(screen("② ステージ1 計測中（5びょう）", f'''{stars()}{track(STAGE_MARKS, 0.36, 0.40)}
+S.append(screen("② ステージ1 計測中（5びょう）", f'''{stars()}{track(STAGE_MARKS, 0.36, 0.40, earth=True)}
 <div style="position:absolute;left:760px;top:60px;width:560px;text-align:center">{pill("ステージ1", "rgba(255,255,255,0.15)", size=34)}
   <div style="margin-top:18px;font-size:44px;font-weight:700">のこり <span style="font-size:110px;color:{CYAN};font-weight:900">3.4</span> びょう</div></div>
 {db_box(760, 330, "86.2")}
@@ -108,7 +143,7 @@ S.append(screen("② ステージ1 計測中（5びょう）", f'''{stars()}{tra
   <div style="margin-top:18px">{pill("★うちゅう まで あと 28km！", "#FF5A5F", size=36)}</div></div>
 {ranking()}''', bg()))
 # 3 目標1クリア
-S.append(screen("③ もくひょう1 クリアの瞬間（ステージ1のとちゅう）", f'''{stars()}{track([m if m[0]!="うちゅう" else ("うちゅう","100km","done",0.45) for m in STAGE_MARKS], 0.47, 0.44)}
+S.append(screen("③ もくひょう1 クリアの瞬間（ステージ1のとちゅう）", f'''{stars()}{track([m if m[0]!="うちゅう" else ("うちゅう","100km","done",0.45) for m in STAGE_MARKS], 0.47, 0.44, earth=True)}
 <div style="position:absolute;left:640px;top:250px;width:700px;height:470px;border-radius:48px;background:linear-gradient(135deg,#FFD166,#FF9F43);color:#3A1F00;text-align:center;box-shadow:0 0 0 14px rgba(255,209,102,0.25),0 30px 80px rgba(0,0,0,0.4)">
   <div style="margin-top:44px;font-size:44px;font-weight:900">もくひょう1</div>
   <div style="font-size:140px;font-weight:900;line-height:1.05">クリア！</div>
@@ -116,9 +151,24 @@ S.append(screen("③ もくひょう1 クリアの瞬間（ステージ1のと�
   <div style="margin-top:22px;font-size:32px;white-space:nowrap">つぎは ★つき！ こえを だしつづけよう</div></div>
 <div style="position:absolute;left:640px;top:780px;width:700px;text-align:center;font-size:40px;font-weight:700;white-space:nowrap">のこり <span style="font-size:80px;color:{CYAN};font-weight:900">2.1</span> びょう　<span style="color:{YELLOW};font-weight:900">89.0 dB</span></div>
 {ranking()}''', bg()))
+# 3.5 ブースター
+S.append(screen("④ ブースター発射！（5びょうで つきに とどかなかったとき）", f'''{stars(110)}
+<div style="position:absolute;left:250px;top:180px;width:180px;height:780px;border-radius:90px;background:linear-gradient(0deg,rgba(255,183,3,0) 0%,rgba(255,183,3,0.55) 45%,rgba(255,243,176,0.9) 100%)"></div>
+<div style="position:absolute;left:250px;top:40px">{rocket(scale=0.95)}</div>
+<div style="position:absolute;left:200px;top:300px;width:280px;height:120px;border-radius:999px;background:rgba(255,255,255,0.18)"></div>
+<div style="position:absolute;left:600px;top:150px;width:740px;text-align:center">
+  {pill("ブースター はっしゃ！", "linear-gradient(90deg,#FF9F43,#FF5A5F)", size=64)}
+  <div style="margin-top:28px;font-size:52px;font-weight:900;white-space:nowrap">つきまで ワープ！</div>
+  <div style="margin-top:14px;font-size:32px;color:#B9C0FF;white-space:nowrap">うちゅう までは じぶんの ちからで とどいたよ</div></div>
+<div style="position:absolute;left:640px;top:520px;width:660px;padding:34px 40px;border-radius:40px;background:rgba(255,255,255,0.10);border:3px solid rgba(255,255,255,0.2);text-align:center">
+  <div style="font-size:38px;font-weight:900;white-space:nowrap">みんなで おうえん！「がんばれー！」</div>
+  <div style="margin-top:22px;height:40px;border-radius:20px;background:rgba(255,255,255,0.15)"><div style="width:72%;height:100%;border-radius:20px;background:linear-gradient(90deg,#FFD166,#FF5A5F)"></div></div>
+  <div style="margin-top:14px;font-size:28px;color:#D7DBFF;white-space:nowrap">おうえんの こえで ブースターが パワーアップ</div></div>
+<div style="position:absolute;left:640px;top:830px;width:660px;text-align:center;font-size:34px;color:#B9C0FF;white-space:nowrap">このあと ∞エンドレスモード へ！</div>
+{ranking()}''', bg()))
 # 4 エンドレス
 END_MARKS = [("つき", "500km", "done", 0.05), ("かせい", "800km", "mark", 0.30), ("もくせい", "1,200km", "mark", 0.58), ("どせい", "1,600km", "mark", 0.86)]
-S.append(screen("④ エンドレスモード（つき クリア後・タイマーなし）", f'''{stars(110)}{track(END_MARKS, 0.62, 0.86)}
+S.append(screen("⑤ エンドレスモード（全員・最長10びょう）", f'''{stars(110)}{track(END_MARKS, 0.62, 0.86, psize=190)}
 <div style="position:absolute;left:740px;top:50px;width:600px;text-align:center">
   {pill("∞ エンドレスモード", "linear-gradient(90deg,#FF5A8A,#B14CFF)", size=44)}
   <div style="margin-top:12px;font-size:30px;color:#F3D9FF;white-space:nowrap">つきの その先へ！ こえが つづくかぎり とべ！</div></div>
@@ -128,16 +178,17 @@ S.append(screen("④ エンドレスモード（つき クリア後・タイマ�
   <div style="font-size:110px;font-weight:900;line-height:1.05;color:#fff">1,240<span style="font-size:48px"> km</span></div>
   <div style="margin-top:10px">{pill("チャンピオンまで あと 380km！", "#B14CFF", size=34)}</div></div>
 <div style="position:absolute;left:760px;top:900px;width:560px">
-  <div style="display:flex;justify-content:space-between;font-size:26px;color:#E2C9FF"><span style="white-space:nowrap">こえが とぎれたら おわり</span><span style="white-space:nowrap">8.2 / 15びょう</span></div>
-  <div style="margin-top:10px;height:30px;border-radius:15px;background:rgba(255,255,255,0.15)"><div style="width:82%;height:100%;border-radius:15px;background:linear-gradient(90deg,#7CF29C,#FFD166)"></div></div></div>
+  <div style="display:flex;justify-content:space-between;font-size:26px;color:#E2C9FF"><span style="white-space:nowrap">こえが とぎれたら おわり</span><span style="white-space:nowrap">6.4 / 10びょう</span></div>
+  <div style="margin-top:10px;height:30px;border-radius:15px;background:rgba(255,255,255,0.15)"><div style="width:64%;height:100%;border-radius:15px;background:linear-gradient(90deg,#7CF29C,#FFD166)"></div></div></div>
 {ranking()}''', bg(True)))
 # 5 結果（ステージ1のみ）
-def result(title, km, place, badges, new=False, endless=False):
+def result(title, km, place, badges, new=False, endless=False, planet=None):
     b = "".join(f'<div style="width:150px;height:150px;border-radius:50%;background:{c};display:flex;align-items:center;justify-content:center;flex-direction:column;color:{fc};font-weight:900"><div style="font-size:56px;line-height:1">{i}</div><div style="font-size:24px">{t}</div></div>'
                 for i, t, c, fc in badges)
     newb = f'<div style="position:absolute;left:600px;top:40px;width:740px;text-align:center">{pill("★ きょうの しんきろく！ ★", "linear-gradient(90deg,#FFD166,#FF9F43)", "#3A1F00", 52)}</div>' if new else ""
     confetti = "".join(f'<div style="position:absolute;left:{random.randint(560,1360)}px;top:{random.randint(0,1040)}px;width:{random.choice([14,18,22])}px;height:{random.choice([8,10])}px;border-radius:3px;background:{random.choice([YELLOW,PINK,CYAN,"#7CF29C"])};transform:rotate({random.randint(0,180)}deg)"></div>' for _ in range(60)) if new else ""
-    return f'''{stars()}{confetti}
+    big = peek(planet, 950, 460, left=-260) if planet else ""
+    return f'''{stars()}{big}{confetti}
 <div style="position:absolute;left:120px;top:250px">{rocket(scale=1.5)}</div>
 {newb}
 <div style="position:absolute;left:560px;top:150px;width:780px;text-align:center">
@@ -150,29 +201,29 @@ def result(title, km, place, badges, new=False, endless=False):
     <div style="width:420px;padding:18px;border-radius:20px;background:#fff;color:#12153D;font-size:34px;text-align:left">なまえ：<span style="color:#8A8FB8">（スタッフが にゅうりょく）</span></div>
     {pill("けってい", "#FF5A5F", size=34)}</div></div>
 {ranking("はると" if new else None)}'''
-S.append(screen("⑤ 結果（もくひょう1 まで）", result("うちゅうまで とどいた！", "180", "きょう 7い", [("★", "うちゅう", YELLOW, "#3A1F00"), ("☆", "つき", "rgba(255,255,255,0.15)", "#B9C0FF")]), bg()))
-S.append(screen("⑥ 結果（エンドレス＋しんきろく）", result("どせい まで いった！", "1,620", "きょう 1い", [("★", "うちゅう", YELLOW, "#3A1F00"), ("★", "つき", YELLOW, "#3A1F00"), ("∞", "エンドレス", "#B14CFF", "#fff")], new=True, endless=True), bg(True)))
+S.append(screen("⑥ 結果（ふつう）", result("かせい まで いった！", "820", "きょう 5い", [("★", "うちゅう", YELLOW, "#3A1F00"), ("★", "つき", YELLOW, "#3A1F00"), ("∞", "かせい", "#B14CFF", "#fff")], planet="mars"), bg(True)))
+S.append(screen("⑦ 結果（しんきろく）", result("どせい まで いった！", "1,620", "きょう 1い", [("★", "うちゅう", YELLOW, "#3A1F00"), ("★", "つき", YELLOW, "#3A1F00"), ("∞", "どせい", "#B14CFF", "#fff")], new=True, endless=True, planet="saturn"), bg(True)))
 
-RULES = '''<div class="shot"><div class="shot-title">ルール案（この内容で作り込みます・変えたい所を教えてください）</div>
+RULES = '''<div class="shot"><div class="shot-title">ルール案 v2（全員エンドレス・最長10秒）</div>
 <div class="rules">
 <div class="r-col"><div class="r-h">ゲームの流れ</div><ol>
-<li>声を出すと自動でスタート（今と同じ）</li>
+<li>声を出すと自動でスタート</li>
 <li><b>ステージ1：5秒</b>。声の大きさが積み重なって、ロケットの高さになる</li>
-<li>途中で <b>★もくひょう1「うちゅう」</b>、<b>★もくひょう2「つき」</b>。届いた瞬間に「クリア！」演出</li>
-<li>5秒以内に「つき」に届いたら <b>∞エンドレスモード</b>：タイマーが消え、声が続くかぎり上昇（かせい→もくせい→どせい…）</li>
-<li>エンドレスは <b>声が 1秒 とぎれたら終了</b>。のどを守るため <b>最長 15秒</b> で終了</li>
-<li>届かなかった人も「うちゅうまで行けた！」などのバッジで終われる</li></ol></div>
+<li><b>★もくひょう1「うちゅう」→ ★もくひょう2「つき」</b>。ふつうの声で届く難しさにして、届くたびに「クリア！」</li>
+<li>5秒で「つき」に届かなかった子は <b>「ブースター発射！」</b>で月までワープ（失敗を見せない）。会場の「がんばれー！」の声でブースターがパワーアップ</li>
+<li><b>全員が ∞エンドレスモードへ</b>：声が続くかぎり上昇（かせい→もくせい→どせい…）</li>
+<li>エンドレスは <b>声が1秒とぎれたら終了</b>、<b>最長10秒</b></li></ol></div>
 <div class="r-col"><div class="r-h">スコアとゴースト</div><ul>
-<li>ランキングは <b>とどいた高さ（km）</b>。デシベルの数字は画面に大きく出し続ける（担当の「測定値の表示」）</li>
-<li>平均デシベルも結果に表示（参考値）</li>
-<li>ゴースト＝<b>きょうの1位の飛び方</b>を、同じ時間で横に再生。ステージ1でもエンドレスでも一緒に飛ぶ</li>
+<li>勝負はエンドレスで <b>どこまで行けたか（高さ km）</b>。ランキングもこれ</li>
+<li>デシベルの数字は全画面で大きく表示（担当の「測定値の表示」）。結果には平均デシベルも出す</li>
+<li>ゴースト＝<b>きょうの1位の飛び方</b>を同じ時間で横に再生</li>
+<li>星（うちゅう・つき・かせい…）を通るたびにバッジ。結果で「どこまで行けたか」を言葉で言える</li>
 <li>高さの km はゲーム内の数字（本物の距離ではない）</li></ul></div>
 <div class="r-col"><div class="r-h">【要確認】決めたいこと</div><ul>
-<li>もくひょう2「つき」の難しさ：何割くらいの子がエンドレスに行けるのがよい？（例：3人に1人）</li>
-<li>エンドレスの最長時間：15秒でよい？（列の進み・のどの負担）</li>
-<li>小さい子向けに「やさしいモード」（もくひょうを低く）を用意する？</li>
+<li>ブースター中の「おうえん」を同じマイクで拾う？（拾うと盛り上がるが、記録には入れない）</li>
 <li>名前入力：スタッフが入れる／入れない（ニックネームのみ）</li>
-<li>明るい会場の場合は背景をもう少し明るい青にする</li></ul></div>
+<li>明るい会場の場合は背景をもう少し明るい青にする</li>
+<li>BGM・効果音を出す？（スピーカーの音をマイクが拾わないよう配置に注意）</li></ul></div>
 </div></div>'''
 
 CSS = f'''*{{box-sizing:border-box}} body{{margin:0;background:#E9E9EF}}
