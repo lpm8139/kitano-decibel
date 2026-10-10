@@ -3,153 +3,166 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>声の大きさ競争</title>
+  <title>ロケット かんせいしつ</title>
+  <link rel="stylesheet" href="fonts/fonts.css">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
   <!-- start.bat を使わずファイルを直接開いた場合はJSが動かないので、この案内が出たままになる -->
   <div id="server-banner" class="server-banner">このページは start.bat から開いてください（index.html を直接開くと動きません）</div>
-  <div id="app" data-state="idle" data-lead="none" data-ghost="none">
-    <!-- ===== メイン（プロジェクター表示） ===== -->
-    <main class="stage">
-      <header class="topbar">
-        <h1 class="title">声の大きさ競争</h1>
-        <div class="topbar-right">
-          <span id="clip-warning" class="clip" hidden>CLIP! 音が割れています（ゲインを下げる）</span>
-          <span id="sync-status" class="sync-status" data-kind="pending">保存サーバー確認中…</span>
-          <span id="mic-status" class="mic-status" data-kind="pending">マイク準備中…</span>
+
+  <div id="viewport" class="viewport">
+    <!-- 1920×1080 の舞台。画面サイズに合わせて JS で拡大縮小する -->
+    <div id="stage" class="stage" data-state="idle" data-theme="light" data-ghost="none">
+
+      <!-- ===== ヘッダー ===== -->
+      <header class="hdr">
+        <div class="hdr-title">ロケット かんせいしつ</div>
+        <div class="hdr-catch">きみの こえが ロケットの エンジン！</div>
+        <div id="rehearsal-badge" class="hdr-badge rehearsal" hidden>リハーサル中（ランキングに入りません）</div>
+        <div id="clip-warning" class="hdr-badge clip" hidden>CLIP! 音が割れています（受信機のゲインを下げる）</div>
+        <div class="lamps" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+        <div class="hdr-status">
+          <div id="sync-status" class="pill-status" data-kind="pending">保存サーバー確認中…</div>
+          <div id="mic-status" class="pill-status" data-kind="pending">マイク準備中…</div>
         </div>
       </header>
 
-      <section class="center">
-        <div id="state-label" class="state-label">待機中</div>
+      <!-- ===== メインモニター（ロケット） ===== -->
+      <div id="main-title" class="mon-title main-title">メインモニター：ロケット</div>
+      <section class="monitor mon-main">
+        <div id="world-screen" class="screen space">
+          <div class="stars far" id="stars-far"></div>
+          <div class="stars near" id="stars-near"></div>
+          <div class="speedlines" aria-hidden="true"></div>
+          <div id="world" class="world"></div>
 
-        <div id="readout" class="readout">
-          <span id="db-int" class="db-int">--</span><span id="db-frac" class="db-frac"></span><span class="db-unit">dB</span>
-        </div>
-        <div id="timer" class="timer">計測 5 秒</div>
-        <p id="message" class="message">Space キーでスタンバイ</p>
+          <div id="ghost-hint" class="ghost-hint" hidden></div>
+          <div id="idle-caption" class="idle-caption">
+            <div class="big">はっしゃ じゅんび OK！</div>
+            <div class="sub">★うちゅう → ★つき → ∞エンドレス を めざそう</div>
+          </div>
+          <div id="stage-timer" class="stage-timer" hidden><div class="stage-timer-fill" id="stage-timer-fill"></div><span id="stage-timer-text"></span></div>
+          <div id="endless-badge" class="endless-badge" hidden>∞ エンドレスモード</div>
+          <div id="pop" class="pop"></div>
+          <div id="goal-card" class="goal-card" hidden>
+            <div class="goal-card-sub" id="goal-card-sub">もくひょう1</div>
+            <div class="goal-card-main">クリア！</div>
+            <div class="goal-card-place" id="goal-card-place">うちゅうに とうちゃく！</div>
+          </div>
+          <div id="booster-pill" class="center-pill booster-pill" hidden>ブースター はっしゃ！ つきまで ワープ！</div>
+          <div id="endless-pill" class="center-pill endless-pill" hidden>∞ エンドレスモード スタート！</div>
 
-        <!-- 結果表示 -->
-        <div id="result" class="result" hidden>
-          <div id="result-banner" class="result-banner" hidden>NEW RECORD!</div>
-          <div class="result-label">スコア</div>
-          <div class="result-score"><span id="result-score">0.0</span><span class="db-unit">dB</span></div>
-          <div id="result-rank" class="result-rank"></div>
-          <form id="result-form" class="result-form" autocomplete="off">
-            <input id="result-name" type="text" maxlength="20" placeholder="名前（空欄OK）" aria-label="名前">
-            <button type="submit" id="btn-result-ok" class="btn btn-primary">決定 (Enter)</button>
-            <button type="button" id="btn-result-discard" class="btn btn-ghost">この記録を破棄</button>
-          </form>
-          <p class="result-hint">Enter で決定して待機へ / 入力欄の外で Space を押すと次の人のスタンバイへ</p>
+          <!-- 結果 -->
+          <div id="result-view" class="result-view" hidden>
+            <div id="result-planet" class="result-planet"></div>
+            <div id="result-rocket" class="result-rocket"></div>
+            <div id="result-place" class="result-place"></div>
+            <div id="result-badges" class="result-badges"></div>
+            <div id="newrecord-pill" class="center-pill newrecord-pill" hidden>★ きょうの しんきろく！ ★</div>
+          </div>
         </div>
       </section>
 
-      <!-- ===== ゴーストレース ===== -->
-      <section id="race" class="race">
-        <div id="lead-badge" class="lead-badge" aria-live="polite"></div>
-        <div class="lane lane-you">
-          <div class="lane-head">
-            <span id="you-name" class="lane-name">あなた</span>
-            <span class="lane-value"><span id="you-value">0</span> pt</span>
+      <!-- ===== 右上モニター（あそびかた／こえパワー／おうえん／なまえ） ===== -->
+      <div id="side-title" class="mon-title side-title">あそびかた</div>
+      <section class="monitor mon-side">
+        <div class="screen space">
+          <div class="side-panel" data-panel="howto">
+            <ol class="howto">
+              <li><span>1</span>マイクの まえに たつ</li>
+              <li><span>2</span>「わーーーっ！」と こえを だす</li>
+              <li><span>3</span>ロケットを うちゅうへ！</li>
+            </ol>
           </div>
-          <div class="track"><div id="you-fill" class="fill"></div></div>
-        </div>
-        <div class="lane lane-ghost">
-          <div class="lane-head">
-            <span id="ghost-name" class="lane-name">ゴースト</span>
-            <span class="lane-value"><span id="ghost-value">0</span> pt</span>
+          <div class="side-panel" data-panel="db">
+            <div class="db-big"><span id="db-int">--</span><span id="db-frac" class="db-frac"></span></div>
+            <div class="db-sub">デシベル</div>
+            <div class="meter"><i id="db-bar"></i><b id="db-threshold" class="meter-mark"></b></div>
           </div>
-          <div class="track"><div id="ghost-fill" class="fill"></div></div>
+          <div class="side-panel" data-panel="cheer">
+            <div class="cheer-title">みんなで おうえん！「がんばれー！」</div>
+            <div class="meter meter-cheer"><i id="cheer-bar"></i></div>
+            <div class="cheer-note">おうえんの こえで ブースターが パワーアップ（きろくには はいらない）</div>
+          </div>
+          <div class="side-panel" data-panel="warp">
+            <div class="cheer-title">ブースター はっしゃちゅう！</div>
+            <div class="cheer-note">このあと ∞エンドレスモード。もういちど こえを だそう！</div>
+          </div>
+          <div class="side-panel" data-panel="name">
+            <div class="name-q">うちゅうひこうしの なまえを おしえてね</div>
+            <input id="result-name" class="name-input" type="text" maxlength="20" autocomplete="off" spellcheck="false" aria-label="なまえ">
+            <div class="name-help">（スタッフ用）Enter で けってい ／ Esc で なまえなし ／ <button type="button" id="btn-discard" class="link-btn">この きろくを はき</button></div>
+          </div>
+          <div class="side-panel" data-panel="score">
+            <div class="db-big score-big"><span id="score-big">0</span></div>
+            <div class="db-sub">km（とどいた たかさ）</div>
+            <div class="name-help">（スタッフ用）Space で つぎの ひと ／ Enter・Esc で たいき ／ Delete で きろくを はき</div>
+          </div>
         </div>
       </section>
 
-      <footer class="best-bar">
-        <span class="best-label">本日ベスト</span>
-        <span id="best-score" class="best-score">--</span>
-        <span id="best-name" class="best-name"></span>
+      <!-- ===== ミッション状況 ===== -->
+      <div id="status-title" class="mon-title status-title">マイク チェック</div>
+      <section class="monitor mon-status">
+        <div class="screen space">
+          <div class="cells">
+            <div class="cell" id="cell-0"><div class="cell-k"></div><div class="cell-v"></div></div>
+            <div class="cell" id="cell-1"><div class="cell-k"></div><div class="cell-v"></div></div>
+            <div class="cell" id="cell-2"><div class="cell-k"></div><div class="cell-v"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== ランキング ===== -->
+      <div class="mon-title rank-title">きょうの ランキング（とどいた たかさ）</div>
+      <section class="monitor mon-rank">
+        <div class="screen space">
+          <ol id="rank-list" class="rank-list"></ol>
+        </div>
+      </section>
+
+      <!-- ===== 操作卓 ===== -->
+      <footer class="console">
+        <i class="knob k1"></i><i class="knob k2"></i><i class="knob k3"></i><i class="knob k4"></i>
+        <i class="slider s1"></i><i class="slider s2"></i><i class="slider s3"></i>
+        <i class="slider s4"></i><i class="slider s5"></i>
+        <i class="knob k6"></i>
+        <button type="button" id="btn-admin" class="knob k5 admin-btn" title="管理者画面（Ctrl+Shift+A）" aria-label="管理者画面"></button>
+        <div id="strip" class="strip">こえを だすと はっしゃ！</div>
+        <div class="staff-keys">Space スタンバイ／スタート ・ Esc ちゅうだん ・ F ぜんがめん ・ Ctrl+Shift+A 管理</div>
       </footer>
-    </main>
 
-    <!-- ===== 右：本日TOP10 ===== -->
-    <aside class="side">
-      <h2 class="side-title">本日 TOP10</h2>
-      <ol id="top10" class="top10"></ol>
-      <div class="side-actions">
-        <button type="button" id="btn-csv" class="btn btn-ghost">CSV出力</button>
-        <button type="button" id="btn-settings" class="btn btn-ghost">設定 (S)</button>
-        <button type="button" id="btn-reset" class="btn btn-danger">本日の記録をリセット</button>
-      </div>
-      <p class="keys">Space スタンバイ/開始 ・ Esc 中断 ・ F 全画面 ・ S 設定</p>
-    </aside>
-  </div>
+      <div id="confetti" class="confetti" aria-hidden="true"></div>
+      <div id="flash" class="flash"></div>
+      <div id="toast" class="toast" role="status"></div>
 
-  <!-- ===== 設定パネル ===== -->
-  <div id="settings" class="overlay" hidden>
-    <div class="panel" role="dialog" aria-labelledby="settings-title">
-      <h2 id="settings-title">設定</h2>
+      <!-- ===== 管理者画面（中身は js/admin.js が作る） ===== -->
+      <div id="admin" class="admin" hidden></div>
 
-      <div class="live-box">
-        <div>現在の入力 <strong id="live-db">--</strong> dB <span class="dim">(<span id="live-dbfs">--</span> dBFS)</span></div>
-        <div class="dim">校正時は、ここの dBFS とスマホ騒音計の値を見比べます。</div>
+      <!-- ===== 暗証番号 ===== -->
+      <div id="pin" class="overlay" hidden>
+        <form id="pin-form" class="dialog" autocomplete="off">
+          <h2>管理者画面</h2>
+          <p>暗証番号を入れて Enter（Esc でもどる）</p>
+          <input id="pin-input" class="pin-input" type="password" inputmode="numeric" maxlength="8" aria-label="暗証番号">
+          <p id="pin-error" class="pin-error"></p>
+        </form>
       </div>
 
-      <label class="field">
-        <span>入力デバイス</span>
-        <select id="set-device"></select>
-      </label>
-      <label class="field">
-        <span>計測秒数（3〜10）</span>
-        <input id="set-duration" type="number" min="3" max="10" step="1">
-      </label>
-      <label class="field">
-        <span>開始しきい値 dB（超えた瞬間に計測開始）</span>
-        <input id="set-threshold" type="number" min="0" max="140" step="1">
-      </label>
-      <label class="field">
-        <span>floor dB（これ以下は競争ポイントに加算しない）</span>
-        <input id="set-floor" type="number" min="0" max="120" step="1">
-      </label>
-      <label class="field">
-        <span>校正オフセット dB（表示dB = dBFS + オフセット）</span>
-        <input id="set-offset" type="number" min="-100" max="200" step="0.5">
-      </label>
-      <label class="field">
-        <span>スコア方式</span>
-        <select id="set-method">
-          <option value="mean">dBサンプルの平均（既定）</option>
-          <option value="leq">エネルギー平均 Leq</option>
-        </select>
-      </label>
-
-      <div class="live-box">
-        <div>記録の保存先（PC のフォルダ）</div>
-        <div class="data-dir"><code id="data-dir">（保存サーバー未接続）</code></div>
-        <div class="dim">記録は1件ごとにここへ自動保存されます。イベント後はこのフォルダごと USB などにコピーしてください。</div>
-      </div>
-
-      <p class="note">※ 記録が残っている状態で校正オフセット・スコア方式を変えると、過去の記録と比較できなくなります。本番中は触らないでください。</p>
-      <div class="panel-actions">
-        <button type="button" id="btn-settings-close" class="btn btn-primary">閉じる (S / Esc)</button>
+      <!-- ===== 確認ダイアログ（alert/confirm の代わり） ===== -->
+      <div id="modal" class="overlay" hidden>
+        <div class="dialog" role="alertdialog" aria-labelledby="modal-title" aria-describedby="modal-message">
+          <h2 id="modal-title"></h2>
+          <p id="modal-message"></p>
+          <div class="dialog-actions">
+            <button type="button" id="modal-cancel" class="btn">キャンセル</button>
+            <button type="button" id="modal-ok" class="btn btn-danger">OK</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
-
-  <!-- ===== 確認モーダル（alert/confirm の代わり） ===== -->
-  <div id="modal" class="overlay" hidden>
-    <div class="panel panel-small" role="alertdialog" aria-labelledby="modal-title" aria-describedby="modal-message">
-      <h2 id="modal-title"></h2>
-      <p id="modal-message"></p>
-      <div class="panel-actions">
-        <button type="button" id="modal-cancel" class="btn btn-ghost">キャンセル</button>
-        <button type="button" id="modal-ok" class="btn btn-danger">OK</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="flash" class="flash"></div>
-  <div id="announce" class="announce"></div>
-  <div id="toast" class="toast" role="status"></div>
 
   <script type="module" src="js/app.js"></script>
 </body>

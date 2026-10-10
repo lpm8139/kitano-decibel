@@ -3,6 +3,8 @@
 // 前半は純関数（日付キー・並べ替え・設定の正規化・CSV生成）でテスト対象。
 // 後半は localStorage 読み書き（storage を引数で差し替え可能）。import しただけでは何も触らない。
 
+import { LANDMARKS } from './game.js';
+
 export const STORAGE_PREFIX = 'kitano-decibel';
 export const SETTINGS_KEY = `${STORAGE_PREFIX}:settings`;
 
@@ -87,20 +89,50 @@ export function normalizeName(name) {
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_SETTINGS = Object.freeze({
+  // マイク・計測
   deviceId: '', // '' = 既定のマイク
-  duration: 5, // 計測秒数
-  threshold: 65, // 計測開始しきい値（表示dB）
-  floor: 40, // progress の floor（表示dB）
-  offset: 100, // 校正オフセット（仮値。dBFS + offset が表示dB）
-  scoreMethod: 'mean', // 'mean' | 'leq'
+  offset: 100, // 校正オフセット（表示dB = dBFS + offset）
+  threshold: 65, // 計測開始しきい値（表示dB）。エンドレス中はこれ未満を「声がとぎれた」とみなす
+  floor: 55, // これ以下の声は高さに加算しない（表示dB）
+  // ゲーム（難易度）
+  kmRate: 5, // のびやすさ：floor を 1dB 超えるごとに 1 秒で何 km 上がるか
+  goal1Km: 100, // もくひょう1「うちゅう」
+  goal2Km: 500, // もくひょう2「つき」
+  stage1Sec: 5,
+  endlessMaxSec: 10,
+  silenceEndSec: 1,
+  booster: true, // 5秒で月に届かなかったらブースターで月へ
+  cheerBoost: true, // ブースター中の会場の声をゲージに表示
+  ghost: true, // 今日の1位をゴーストで表示
+  nameInput: true,
+  // サウンド
+  bgm: true,
+  bgmVolume: 0.4,
+  muteBgmDuringRun: true, // 計測中は BGM を消す（スピーカーの音で dB が上がらないように）
+  se: true,
+  seVolume: 0.7,
+  seDuringRun: false, // 計測中にも効果音を鳴らす（dB に影響するので既定オフ）
+  // 表示・運用
+  theme: 'light', // 'light'（明るい管制室） | 'dark'（暗い宇宙）
+  rehearsal: false, // オン中の記録はランキング・ゴーストに入れない
+  adminPin: '0000',
 });
 
 export const SETTINGS_LIMITS = Object.freeze({
-  duration: { min: 3, max: 10 },
+  offset: { min: -100, max: 200 },
   threshold: { min: 0, max: 140 },
   floor: { min: 0, max: 120 },
-  offset: { min: -100, max: 200 },
+  kmRate: { min: 0.5, max: 50 },
+  goal1Km: { min: 10, max: 780, integer: true },
+  goal2Km: { min: 20, max: 790, integer: true }, // かせい(800)より手前
+  stage1Sec: { min: 3, max: 10, integer: true },
+  endlessMaxSec: { min: 3, max: 30, integer: true },
+  silenceEndSec: { min: 0.3, max: 3 },
+  bgmVolume: { min: 0, max: 1 },
+  seVolume: { min: 0, max: 1 },
 });
+
+const BOOL_KEYS = ['booster', 'cheerBoost', 'ghost', 'nameInput', 'bgm', 'muteBgmDuringRun', 'se', 'seDuringRun', 'rehearsal'];
 
 function clampNumber(value, fallback, min, max, integer = false) {
   if (value === null || value === undefined) return fallback;
@@ -111,19 +143,26 @@ function clampNumber(value, fallback, min, max, integer = false) {
   return Math.min(max, Math.max(min, n));
 }
 
-/** 任意の入力から、範囲内に収まった完全な設定オブジェクトを作る。 */
+function toBool(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (value === 'true' || value === 1 || value === '1' || value === 'on') return true;
+  if (value === 'false' || value === 0 || value === '0' || value === 'off') return false;
+  return fallback;
+}
+
+/** 任意の入力から、範囲内に収まった完全な設定オブジェクトを作る（知らない項目は捨てる）。 */
 export function normalizeSettings(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
-  const L = SETTINGS_LIMITS;
   const d = DEFAULT_SETTINGS;
-  return {
-    deviceId: typeof r.deviceId === 'string' ? r.deviceId : d.deviceId,
-    duration: clampNumber(r.duration, d.duration, L.duration.min, L.duration.max, true),
-    threshold: clampNumber(r.threshold, d.threshold, L.threshold.min, L.threshold.max),
-    floor: clampNumber(r.floor, d.floor, L.floor.min, L.floor.max),
-    offset: clampNumber(r.offset, d.offset, L.offset.min, L.offset.max),
-    scoreMethod: r.scoreMethod === 'leq' ? 'leq' : 'mean',
-  };
+  const out = { deviceId: typeof r.deviceId === 'string' ? r.deviceId : d.deviceId };
+  for (const [k, lim] of Object.entries(SETTINGS_LIMITS)) {
+    out[k] = clampNumber(r[k], d[k], lim.min, lim.max, Boolean(lim.integer));
+  }
+  if (out.goal2Km <= out.goal1Km) out.goal2Km = Math.min(SETTINGS_LIMITS.goal2Km.max, out.goal1Km + 10);
+  for (const k of BOOL_KEYS) out[k] = toBool(r[k], d[k]);
+  out.theme = r.theme === 'dark' ? 'dark' : 'light';
+  out.adminPin = typeof r.adminPin === 'string' && /^\d{4,8}$/.test(r.adminPin) ? r.adminPin : d.adminPin;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,25 +181,26 @@ export function neutralizeFormula(text) {
   return /^[=+\-@\t\r]/.test(s) ? `'${s}` : s;
 }
 
-const METHOD_LABEL = { mean: '平均', leq: 'Leq' };
+const PLACE_NAME = Object.fromEntries(LANDMARKS.map((m) => [m.key, m.name]));
 
 /**
- * 本日の記録 → CSV 文字列（先頭に BOM、改行 CRLF。Excel でそのまま開ける）。
- * 行はランキング順。
+ * 記録 → CSV 文字列（先頭に BOM、改行 CRLF。Excel でそのまま開ける）。
+ * 行はランキング順（高さの高い順）。
  */
 export function buildCsv(records) {
-  const header = ['順位', '名前', 'スコア', '方式', '計測秒数', '記録時刻', 'クリップ'];
+  const header = ['順位', '名前', '高さ(km)', 'とどいた場所', '平均dB', 'ブースター', '記録時刻', 'クリップ'];
   const rows = sortRecords(records).map((r, i) => [
     i + 1,
     neutralizeFormula(r.name || ''),
-    Number(r.score).toFixed(1),
-    METHOD_LABEL[r.method] ?? r.method ?? '',
-    r.duration ?? '',
+    Math.round(Number(r.score)),
+    PLACE_NAME[r.reached] ?? '',
+    Number.isFinite(r.meanDb) ? Number(r.meanDb).toFixed(1) : '',
+    r.boosted ? 'あり' : '',
     formatDateTime(r.ts),
     r.clipped ? 'あり' : '',
   ]);
   const body = [header, ...rows].map((row) => row.map(csvEscape).join(',')).join('\r\n');
-  return `﻿${body}\r\n`;
+  return `\ufeff${body}\r\n`;
 }
 
 // ---------------------------------------------------------------------------

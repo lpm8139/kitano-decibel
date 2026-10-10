@@ -86,20 +86,35 @@ test('renameRecord / removeRecord / normalizeName', () => {
 
 // ---- 設定 ----
 
-test('normalizeSettings: 既定値・範囲クランプ・不正値', () => {
+test('normalizeSettings: 既定値・範囲クランプ・不正値・知らない項目は捨てる', () => {
   assert.deepEqual(normalizeSettings(null), { ...DEFAULT_SETTINGS });
   assert.deepEqual(normalizeSettings({}), { ...DEFAULT_SETTINGS });
-  const s = normalizeSettings({ duration: 99, threshold: -5, floor: '55', offset: 'abc', scoreMethod: 'x', deviceId: 3 });
-  assert.equal(s.duration, 10);
+  const s = normalizeSettings({ stage1Sec: 99, threshold: -5, floor: '58', offset: 'abc', deviceId: 3, duration: 5, scoreMethod: 'leq' });
+  assert.equal(s.stage1Sec, 10);
   assert.equal(s.threshold, 0);
-  assert.equal(s.floor, 55);
+  assert.equal(s.floor, 58);
   assert.equal(s.offset, DEFAULT_SETTINGS.offset);
-  assert.equal(s.scoreMethod, 'mean');
   assert.equal(s.deviceId, '');
-  assert.equal(normalizeSettings({ duration: 1 }).duration, 3);
-  assert.equal(normalizeSettings({ duration: 6.6 }).duration, 7);
+  assert.equal('duration' in s, false); // 旧設定は捨てる
+  assert.equal('scoreMethod' in s, false);
+  assert.equal(normalizeSettings({ stage1Sec: 6.6 }).stage1Sec, 7);
   assert.equal(normalizeSettings({ floor: '' }).floor, DEFAULT_SETTINGS.floor); // 空欄は既定値
-  assert.equal(normalizeSettings({ scoreMethod: 'leq' }).scoreMethod, 'leq');
+  assert.equal(normalizeSettings({ endlessMaxSec: 1 }).endlessMaxSec, 3);
+  assert.equal(normalizeSettings({ bgmVolume: 7 }).bgmVolume, 1);
+});
+
+test('normalizeSettings: オン/オフ・背景・暗証番号・目標の高さの前後関係', () => {
+  assert.equal(normalizeSettings({ nameInput: false }).nameInput, false);
+  assert.equal(normalizeSettings({ nameInput: 'false' }).nameInput, false);
+  assert.equal(normalizeSettings({ nameInput: 'x' }).nameInput, true); // 不正値は既定
+  assert.equal(normalizeSettings({ theme: 'dark' }).theme, 'dark');
+  assert.equal(normalizeSettings({ theme: 'neon' }).theme, 'light');
+  assert.equal(normalizeSettings({ adminPin: '1234' }).adminPin, '1234');
+  assert.equal(normalizeSettings({ adminPin: '12' }).adminPin, '0000');
+  assert.equal(normalizeSettings({ adminPin: 1234 }).adminPin, '0000');
+  const g = normalizeSettings({ goal1Km: 300, goal2Km: 200 });
+  assert.ok(g.goal2Km > g.goal1Km, `つき(${g.goal2Km}) は うちゅう(${g.goal1Km}) より上`);
+  assert.equal(normalizeSettings({ goal2Km: 5000 }).goal2Km, 790); // かせいより手前
 });
 
 // ---- CSV ----
@@ -115,17 +130,17 @@ test('csvEscape / neutralizeFormula', () => {
   assert.equal(neutralizeFormula('たろう'), 'たろう');
 });
 
-test('buildCsv: BOM・ヘッダ・ランキング順・エスケープ', () => {
+test('buildCsv: BOM・ヘッダ・高さ順・場所名・エスケープ', () => {
   const t = new Date(2026, 9, 9, 10, 0, 0).getTime();
   const csv = buildCsv([
-    rec('a', 70, t, { name: 'A,B', method: 'mean', duration: 5 }),
-    rec('b', 85.25, t + 1000, { name: '=evil', method: 'leq', duration: 5, clipped: true }),
+    rec('a', 520, t, { name: 'A,B', meanDb: 72.25, reached: 'moon', boosted: true }),
+    rec('b', 1650.4, t + 1000, { name: '=evil', meanDb: 88.1, reached: 'saturn', clipped: true }),
   ]);
-  assert.ok(csv.startsWith('﻿順位,名前,スコア,方式,計測秒数,記録時刻,クリップ\r\n'));
+  assert.ok(csv.startsWith('\ufeff順位,名前,高さ(km),とどいた場所,平均dB,ブースター,記録時刻,クリップ\r\n'));
   const lines = csv.trim().split('\r\n');
   assert.equal(lines.length, 3);
-  assert.equal(lines[1], `1,'=evil,85.3,Leq,5,2026-10-09 10:00:01,あり`.replace('85.3', (85.25).toFixed(1)));
-  assert.equal(lines[2], '2,"A,B",70.0,平均,5,2026-10-09 10:00:00,');
+  assert.equal(lines[1], "1,'=evil,1650,どせい,88.1,,2026-10-09 10:00:01,あり");
+  assert.equal(lines[2], `2,"A,B",520,つき,${(72.25).toFixed(1)},あり,2026-10-09 10:00:00,`);
   assert.equal(buildCsv([]).trim().split('\r\n').length, 1); // ヘッダのみ
 });
 
@@ -165,11 +180,11 @@ test('saveRecords: 容量超過などの例外は false', () => {
 test('saveSettings / loadSettings: 往復と壊れたデータ', () => {
   const st = memoryStorage();
   assert.deepEqual(loadSettings(st), { ...DEFAULT_SETTINGS });
-  saveSettings({ ...DEFAULT_SETTINGS, duration: 8, deviceId: 'dev-1', scoreMethod: 'leq' }, st);
+  saveSettings({ ...DEFAULT_SETTINGS, stage1Sec: 8, deviceId: 'dev-1', nameInput: false }, st);
   const s = loadSettings(st);
-  assert.equal(s.duration, 8);
+  assert.equal(s.stage1Sec, 8);
   assert.equal(s.deviceId, 'dev-1');
-  assert.equal(s.scoreMethod, 'leq');
+  assert.equal(s.nameInput, false);
   st.setItem('kitano-decibel:settings', 'xx');
   assert.deepEqual(loadSettings(st), { ...DEFAULT_SETTINGS });
   assert.deepEqual(loadSettings(null), { ...DEFAULT_SETTINGS });

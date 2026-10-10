@@ -2,7 +2,7 @@
 """
 長時間運用の耐久テスト（加速版）。
 
-  A) 連続計測: 計測3秒の挑戦を N 回くり返し、ブラウザのメモリ（GC後のJSヒープ）・DOM数・
+  A) 連続プレイ: 短い設定（ステージ1 3秒・エンドレス最長3秒）で N 回くり返し、ブラウザのメモリ（GC後のJSヒープ）・DOM数・
      サーバーのメモリ・1件保存にかかる時間の推移を記録する
   B) 待機放置: 何もしない状態でメーターだけ動かし、メモリが増え続けないかを見る
 
@@ -38,18 +38,18 @@ def main():
     rows = []
     with sync_playwright() as pw:
         env = E.Env(pw, sounds)
-        env.fresh({"duration": 3})
+        env.fresh({"stage1Sec": 3, "endlessMaxSec": 3})
         p = env.page("tone-20")
         cdp = p.context.new_cdp_session(p)
         cdp.send("Performance.enable")
         t0 = time.time()
         for i in range(1, N + 1):
             ts = time.time()
-            E.record(p, f"人{i}", manual=False)
-            save = time.time() - ts - 3
+            E.play(p, f"人{i}")
+            save = time.time() - ts - 6
             if i == 1 or i % 25 == 0:
                 h, nodes, lis = heap(cdp, p)
-                rows.append(("計測", i, round(time.time() - t0), h, nodes, lis, rss_kb(env.server.pid), round(save, 2)))
+                rows.append(("プレイ", i, round(time.time() - t0), h, nodes, lis, rss_kb(env.server.pid), round(save, 2)))
                 print(rows[-1], flush=True)
         # B) 放置
         t1 = time.time()

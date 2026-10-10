@@ -1,235 +1,333 @@
 // render.js
-// DOM 更新だけを担当する。状態管理・計算は app.js / scoring.js 側。
+// 画面の更新だけを担当する（状態管理・計算は app.js / game.js）。
 // createRenderer(document) が返すオブジェクトのメソッドを app.js から呼ぶ。
 
 import { topN } from './storage.js';
+import { WorldView } from './world.js';
+import { planetSvg, planetWidth, rocketSvg } from './art.js';
 
-const fmtInt = (n) => Math.round(n).toLocaleString('ja-JP');
-const fmtScore = (n) => Number(n).toFixed(1);
+export const STAGE_W = 1920;
+export const STAGE_H = 1080;
+
+const km = (n) => `${Math.round(n).toLocaleString('ja-JP')}`;
 
 export function createRenderer(doc = document) {
   const $ = (id) => doc.getElementById(id);
   const els = {
-    app: $('app'),
+    viewport: $('viewport'),
+    stage: $('stage'),
+    serverBanner: $('server-banner'),
+    syncStatus: $('sync-status'),
     micStatus: $('mic-status'),
     clip: $('clip-warning'),
-    stateLabel: $('state-label'),
+    rehearsal: $('rehearsal-badge'),
+    mainTitle: $('main-title'),
+    sideTitle: $('side-title'),
+    statusTitle: $('status-title'),
     dbInt: $('db-int'),
     dbFrac: $('db-frac'),
-    timer: $('timer'),
-    message: $('message'),
-    result: $('result'),
-    resultBanner: $('result-banner'),
-    resultScore: $('result-score'),
-    resultRank: $('result-rank'),
+    dbBar: $('db-bar'),
+    dbThreshold: $('db-threshold'),
+    cheerBar: $('cheer-bar'),
+    scoreBig: $('score-big'),
     resultName: $('result-name'),
-    resultForm: $('result-form'),
-    btnResultDiscard: $('btn-result-discard'),
-    leadBadge: $('lead-badge'),
-    youName: $('you-name'),
-    youValue: $('you-value'),
-    youFill: $('you-fill'),
-    ghostName: $('ghost-name'),
-    ghostValue: $('ghost-value'),
-    ghostFill: $('ghost-fill'),
-    bestScore: $('best-score'),
-    bestName: $('best-name'),
-    top10: $('top10'),
-    btnCsv: $('btn-csv'),
-    btnSettings: $('btn-settings'),
-    btnReset: $('btn-reset'),
-    settings: $('settings'),
-    btnSettingsClose: $('btn-settings-close'),
-    liveDb: $('live-db'),
-    liveDbfs: $('live-dbfs'),
-    setDevice: $('set-device'),
-    setDuration: $('set-duration'),
-    setThreshold: $('set-threshold'),
-    setFloor: $('set-floor'),
-    setOffset: $('set-offset'),
-    setMethod: $('set-method'),
+    btnDiscard: $('btn-discard'),
+    btnAdmin: $('btn-admin'),
+    rankList: $('rank-list'),
+    strip: $('strip'),
+    stageTimer: $('stage-timer'),
+    stageTimerFill: $('stage-timer-fill'),
+    stageTimerText: $('stage-timer-text'),
+    endlessBadge: $('endless-badge'),
+    pop: $('pop'),
+    goalCard: $('goal-card'),
+    goalCardSub: $('goal-card-sub'),
+    goalCardPlace: $('goal-card-place'),
+    boosterPill: $('booster-pill'),
+    endlessPill: $('endless-pill'),
+    resultView: $('result-view'),
+    resultPlanet: $('result-planet'),
+    resultRocket: $('result-rocket'),
+    resultPlace: $('result-place'),
+    resultBadges: $('result-badges'),
+    newRecordPill: $('newrecord-pill'),
+    confetti: $('confetti'),
+    flash: $('flash'),
+    toast: $('toast'),
+    admin: $('admin'),
+    pin: $('pin'),
+    pinForm: $('pin-form'),
+    pinInput: $('pin-input'),
+    pinError: $('pin-error'),
     modal: $('modal'),
     modalTitle: $('modal-title'),
     modalMessage: $('modal-message'),
     modalOk: $('modal-ok'),
     modalCancel: $('modal-cancel'),
-    flash: $('flash'),
-    announce: $('announce'),
-    toast: $('toast'),
-    syncStatus: $('sync-status'),
-    serverBanner: $('server-banner'),
-    dataDir: $('data-dir'),
+    cells: [0, 1, 2].map((i) => {
+      const c = $(`cell-${i}`);
+      return { el: c, k: c.querySelector('.cell-k'), v: c.querySelector('.cell-v'), key: '' };
+    }),
+  };
+  const world = new WorldView($('world-screen'));
+
+  /** テキストが変わったときだけ書き換える（毎フレーム呼んでも重くならないように）。 */
+  const setText = (el, text) => {
+    if (el.textContent !== text) el.textContent = text;
+  };
+  const restartAnimation = (el, cls) => {
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+  };
+  const timers = new Map();
+  /** 要素を ms だけ表示する。 */
+  const showFor = (el, ms) => {
+    el.hidden = false;
+    clearTimeout(timers.get(el));
+    timers.set(el, setTimeout(() => (el.hidden = true), ms));
   };
 
-  const stateLabels = {
-    idle: '待機中',
-    standby: 'スタンバイ',
-    measuring: '計測中',
-    result: '結果',
-  };
-
-  /** CSSアニメーションを最初から再生し直す。 */
-  function restartAnimation(el, className) {
-    el.classList.remove(className);
-    void el.offsetWidth; // リフローを挟んで再生をリセット
-    el.classList.add(className);
-  }
-
-  let toastTimer = null;
   let modalOpen = false;
+  let toastTimer = null;
 
   return {
     els,
+    world,
 
-    // ---- 状態・メッセージ ----
+    // ---- 舞台の大きさ（プロジェクターでも小さい画面でも 16:9 で全体が入る） ----
+    fit() {
+      const vw = els.viewport.clientWidth || window.innerWidth;
+      const vh = els.viewport.clientHeight || window.innerHeight;
+      const s = Math.min(vw / STAGE_W, vh / STAGE_H);
+      const x = (vw - STAGE_W * s) / 2;
+      const y = (vh - STAGE_H * s) / 2;
+      els.stage.style.transform = `translate(${x}px, ${y}px) scale(${s})`;
+    },
+
+    // ---- 状態 ----
     setState(state) {
-      els.app.dataset.state = state;
-      els.stateLabel.textContent = stateLabels[state] ?? state;
+      els.stage.dataset.state = state;
     },
-    setMessage(text, tone = '') {
-      els.message.textContent = text;
-      if (tone) els.message.dataset.tone = tone;
-      else delete els.message.dataset.tone;
+    setTheme(theme) {
+      els.stage.dataset.theme = theme;
     },
-    setTimerText(text) {
-      els.timer.textContent = text;
+    setGhostOn(on) {
+      els.stage.dataset.ghost = on ? 'has' : 'none';
+    },
+    setSide(panel, title) {
+      els.stage.dataset.side = panel;
+      setText(els.sideTitle, title);
+    },
+    setTitles({ main, status }) {
+      if (main) setText(els.mainTitle, main);
+      if (status) setText(els.statusTitle, status);
+    },
+    /** 卓の案内表示。tone: '' | 'green' | 'pink' | 'yellow' | 'error' */
+    setStrip(text, tone = '') {
+      setText(els.strip, text);
+      if (tone) els.strip.dataset.tone = tone;
+      else delete els.strip.dataset.tone;
+    },
+    /** ミッション状況の3マス。cells: [{k, v, color, size}]（足りない分は隠す） */
+    setCells(cells) {
+      els.cells.forEach((c, i) => {
+        const d = cells[i];
+        if (!d) {
+          c.el.dataset.empty = '1';
+          return;
+        }
+        delete c.el.dataset.empty;
+        setText(c.k, d.k);
+        setText(c.v, d.v);
+        const style = `color:${d.color || '#fff'};font-size:${d.size || 52}px`;
+        if (c.key !== style) {
+          c.v.setAttribute('style', style);
+          c.key = style;
+        }
+      });
     },
     setMicStatus(text, kind = 'pending') {
-      els.micStatus.textContent = text;
+      setText(els.micStatus, text);
       els.micStatus.dataset.kind = kind;
+    },
+    setSync(text, kind) {
+      setText(els.syncStatus, text);
+      els.syncStatus.dataset.kind = kind;
+    },
+    setServerBanner(text) {
+      els.serverBanner.hidden = !text;
+      if (text) els.serverBanner.textContent = text;
     },
     setClip(on) {
       els.clip.hidden = !on;
     },
+    setRehearsal(on) {
+      els.rehearsal.hidden = !on;
+    },
 
-    // ---- dB 表示 ----
-    /** db: 表示dB（オフセット適用後）。null なら "--"。 */
-    setDb(db, dbfs = null) {
+    // ---- こえパワー ----
+    /** db: 表示dB。null なら "--"。meter は 40〜110dB をバーの 0〜100% にする。 */
+    setDb(db) {
       if (db === null || !Number.isFinite(db)) {
-        els.dbInt.textContent = '--';
-        els.dbFrac.textContent = '';
-        els.liveDb.textContent = '--';
-        els.liveDbfs.textContent = '--';
+        setText(els.dbInt, '--');
+        setText(els.dbFrac, '');
+        els.dbBar.style.width = '0%';
         return;
       }
       const shown = Math.max(0, db);
       const [i, f] = shown.toFixed(1).split('.');
-      els.dbInt.textContent = i;
-      els.dbFrac.textContent = `.${f}`;
-      els.liveDb.textContent = db.toFixed(1);
-      els.liveDbfs.textContent = dbfs === null ? '--' : dbfs.toFixed(1);
+      setText(els.dbInt, i);
+      setText(els.dbFrac, `.${f}`);
+      els.dbBar.style.width = `${Math.min(100, Math.max(0, ((db - 40) / 70) * 100)).toFixed(1)}%`;
+    },
+    setThresholdMark(threshold) {
+      els.dbThreshold.style.left = `${Math.min(100, Math.max(0, ((threshold - 40) / 70) * 100))}%`;
+    },
+    setCheer(db) {
+      const p = db === null || !Number.isFinite(db) ? 0 : Math.min(100, Math.max(0, ((db - 50) / 50) * 100));
+      els.cheerBar.style.width = `${p.toFixed(1)}%`;
     },
 
-    // ---- レース ----
-    /** ゴーストのラベルと有無。record が null なら未登録表示。 */
-    setGhost(record) {
-      els.app.dataset.ghost = record ? 'has' : 'none';
-      els.ghostName.textContent = record
-        ? `ゴースト：${record.name || '名無し'}（${fmtScore(record.score)}）`
-        : 'ゴースト：まだいません（最初の記録をつくろう）';
-    },
-    resetRace() {
-      els.app.dataset.lead = 'none';
-      els.leadBadge.textContent = '';
-      els.youValue.textContent = '0';
-      els.ghostValue.textContent = '0';
-      els.youFill.style.width = '0%';
-      els.ghostFill.style.width = '0%';
-    },
-    /**
-     * @param {{you:number, ghost:number|null, scale:number, lead:'lead'|'behind'|'even'|'solo'}} s
-     */
-    renderRace({ you, ghost, scale, lead }) {
-      const pct = (v) => `${Math.min(100, Math.max(0, (v / scale) * 100)).toFixed(2)}%`;
-      els.youValue.textContent = fmtInt(you);
-      els.youFill.style.width = pct(you);
-      if (ghost !== null) {
-        els.ghostValue.textContent = fmtInt(ghost);
-        els.ghostFill.style.width = pct(ghost);
+    // ---- ステージの残り時間バー ----
+    setStageTimer(frac, text) {
+      if (frac === null) {
+        els.stageTimer.hidden = true;
+        return;
       }
-      els.app.dataset.lead = lead === 'solo' ? 'none' : lead;
-      if (lead === 'lead') {
-        els.leadBadge.textContent = `リード中！  +${fmtInt(you - ghost)}`;
-      } else if (lead === 'behind') {
-        els.leadBadge.textContent = `追いかけろ！  -${fmtInt(ghost - you)}`;
-      } else if (lead === 'even') {
-        els.leadBadge.textContent = '互角！';
-      } else {
-        els.leadBadge.textContent = '';
-      }
+      els.stageTimer.hidden = false;
+      els.stageTimerFill.style.width = `${(Math.min(1, Math.max(0, frac)) * 100).toFixed(1)}%`;
+      setText(els.stageTimerText, text);
     },
-    /** 逆転などの大文字演出。 */
-    announce(text, tone) {
-      els.announce.textContent = text;
-      els.announce.dataset.tone = tone;
-      restartAnimation(els.announce, 'on');
+    setEndlessBadge(on) {
+      els.endlessBadge.hidden = !on;
+    },
+
+    // ---- 演出 ----
+    goalCard(n, placeName) {
+      setText(els.goalCardSub, `もくひょう${n}`);
+      setText(els.goalCardPlace, `${placeName}に とうちゃく！`);
+      showFor(els.goalCard, 1300);
+      restartAnimation(els.goalCard, 'on');
+    },
+    boosterPill(ms = 2800) {
+      showFor(els.boosterPill, ms);
+    },
+    endlessPill(text = '∞ エンドレスモード スタート！', ms = 1700) {
+      els.goalCard.hidden = true;
+      els.endlessPill.textContent = text;
+      showFor(els.endlessPill, ms);
+    },
+    pop(text, tone = '') {
+      els.pop.textContent = text;
+      if (tone) els.pop.dataset.tone = tone;
+      else delete els.pop.dataset.tone;
+      restartAnimation(els.pop, 'on');
+    },
+    clearEffects() {
+      for (const el of [els.goalCard, els.boosterPill, els.endlessPill, els.newRecordPill]) el.hidden = true;
+      els.pop.classList.remove('on');
+      els.confetti.textContent = '';
     },
     flash() {
       restartAnimation(els.flash, 'on');
     },
-
-    // ---- ベスト・TOP10 ----
-    renderBest(record) {
-      els.bestScore.textContent = record ? fmtScore(record.score) : '--';
-      els.bestName.textContent = record ? record.name || '名無し' : 'まだ記録がありません';
+    confetti(n = 110) {
+      const colors = ['#FFD166', '#FF5A8A', '#8ED6FF', '#7CF29C', '#FF7A1A', '#C3B5FF'];
+      const frag = doc.createDocumentFragment();
+      for (let i = 0; i < n; i++) {
+        const c = doc.createElement('i');
+        c.style.left = `${Math.random() * 1920}px`;
+        c.style.background = colors[i % colors.length];
+        c.style.animationDuration = `${2.2 + Math.random() * 2.2}s`;
+        c.style.animationDelay = `${Math.random() * 0.9}s`;
+        c.style.width = `${12 + Math.random() * 12}px`;
+        frag.append(c);
+      }
+      els.confetti.textContent = '';
+      els.confetti.append(frag);
+      setTimeout(() => (els.confetti.textContent = ''), 6000);
     },
-    renderTop10(records, highlightId = null) {
-      els.top10.textContent = '';
-      const top = topN(records, 10);
+
+    // ---- 結果 ----
+    /**
+     * @param {{score:number, place:object, reached:{goal1:boolean, goal2:boolean}, boosted:boolean,
+     *          beyondMoon:boolean, isNewRecord:boolean}} r
+     */
+    showResult({ place, reached, boosted, beyondMoon, isNewRecord, score }) {
+      els.resultPlanet.innerHTML = '';
+      if (place.planet) {
+        const d = 560;
+        els.resultPlanet.style.left = `${-planetWidth(place.planet, d) / 2 + 40}px`;
+        els.resultPlanet.innerHTML = planetSvg(place.planet, d);
+      }
+      els.resultRocket.innerHTML = rocketSvg({ width: 150 });
+      els.resultPlace.innerHTML = '';
+      const line1 = doc.createElement('div');
+      line1.textContent = place.key === 'earth' ? 'もうすこし！' : `${place.name} まで`;
+      const line2 = doc.createElement('div');
+      line2.textContent = place.key === 'earth' ? 'また ちょうせん してね' : 'いった！';
+      els.resultPlace.append(line1, line2);
+      const badges = [];
+      if (reached.goal1) badges.push(['★', 'うちゅう', '']);
+      if (reached.goal2) badges.push(['★', 'つき', boosted ? 'boost' : '']); // ワープで着いたときはオレンジ
+      if (beyondMoon) badges.push(['∞', place.name.length > 6 ? place.name.slice(0, 6) : place.name, 'endless']);
+      els.resultBadges.innerHTML = '';
+      for (const [b, t, cls] of badges) {
+        const el = doc.createElement('div');
+        el.className = `badge ${cls}`;
+        const bb = doc.createElement('b');
+        bb.textContent = b;
+        const sm = doc.createElement('small');
+        sm.textContent = t;
+        el.append(bb, sm);
+        els.resultBadges.append(el);
+      }
+      els.newRecordPill.hidden = !isNewRecord;
+      els.stage.dataset.newrecord = isNewRecord ? '1' : '0';
+      setText(els.scoreBig, km(score));
+      els.resultView.hidden = false;
+    },
+    hideResult() {
+      els.resultView.hidden = true;
+      els.newRecordPill.hidden = true;
+      els.stage.dataset.newrecord = '0';
+      els.resultName.blur();
+    },
+    focusName(name = '') {
+      els.resultName.value = name;
+      els.resultName.focus();
+    },
+    getResultName() {
+      return els.resultName.value;
+    },
+
+    // ---- ランキング（上位6件・2列） ----
+    renderRanking(records, highlightId = null) {
+      els.rankList.textContent = '';
+      const top = topN(records, 6);
       if (top.length === 0) {
         const li = doc.createElement('li');
         li.className = 'empty';
-        li.textContent = 'まだ記録がありません';
-        els.top10.append(li);
+        li.textContent = 'まだ だれも とんでいないよ。さいしょの うちゅうひこうしに なろう！';
+        els.rankList.append(li);
         return;
       }
       top.forEach((r, i) => {
         const li = doc.createElement('li');
         if (r.id === highlightId) li.className = 'current';
         const rank = doc.createElement('span');
-        rank.className = 'rank';
+        rank.className = 'r';
         rank.textContent = String(i + 1);
         const name = doc.createElement('span');
-        name.className = r.name ? 'name' : 'name anon';
-        name.textContent = r.name || '名無し';
+        name.className = r.name ? 'n' : 'n anon';
+        name.textContent = r.name || 'ななし';
         const score = doc.createElement('span');
-        score.className = 'score';
-        score.textContent = fmtScore(r.score);
+        score.className = 's';
+        score.textContent = `${km(r.score)} km`;
         li.append(rank, name, score);
-        els.top10.append(li);
+        els.rankList.append(li);
       });
-    },
-
-    // ---- 結果 ----
-    showResult({ score, rank, total, isNewRecord, name = '' }) {
-      els.resultScore.textContent = fmtScore(score);
-      els.resultRank.textContent = `本日 ${rank} 位 / ${total} 人中`;
-      els.resultBanner.hidden = !isNewRecord; // 表示に切り替わった時点で CSS の pop アニメが再生される
-      els.resultName.value = name;
-      els.result.hidden = false;
-      els.resultName.focus();
-    },
-    hideResult() {
-      els.result.hidden = true;
-      els.resultBanner.hidden = true;
-      els.resultName.blur();
-    },
-    getResultName() {
-      return els.resultName.value;
-    },
-
-    // ---- ファイル保存の状態 ----
-    setSync(text, kind) {
-      els.syncStatus.textContent = text;
-      els.syncStatus.dataset.kind = kind;
-    },
-    /** null で非表示。 */
-    setServerBanner(text) {
-      els.serverBanner.hidden = !text;
-      if (text) els.serverBanner.textContent = text;
-    },
-    setDataDir(path) {
-      els.dataDir.textContent = path || '（保存サーバー未接続）';
     },
 
     // ---- トースト ----
@@ -240,50 +338,50 @@ export function createRenderer(doc = document) {
       toastTimer = setTimeout(() => els.toast.classList.remove('on'), ms);
     },
 
-    // ---- 設定パネル ----
-    isSettingsOpen() {
-      return !els.settings.hidden;
+    // ---- 暗証番号 ----
+    isPinOpen() {
+      return !els.pin.hidden;
     },
-    openSettings() {
-      els.settings.hidden = false;
-    },
-    closeSettings() {
-      els.settings.hidden = true;
-      if (doc.activeElement && doc.activeElement !== doc.body) doc.activeElement.blur();
-    },
-    fillSettings(s) {
-      els.setDuration.value = s.duration;
-      els.setThreshold.value = s.threshold;
-      els.setFloor.value = s.floor;
-      els.setOffset.value = s.offset;
-      els.setMethod.value = s.scoreMethod;
-    },
-    readSettings() {
-      return {
-        deviceId: els.setDevice.value,
-        duration: els.setDuration.value,
-        threshold: els.setThreshold.value,
-        floor: els.setFloor.value,
-        offset: els.setOffset.value,
-        scoreMethod: els.setMethod.value,
-      };
-    },
-    fillDevices(devices, selectedId) {
-      els.setDevice.textContent = '';
-      const def = doc.createElement('option');
-      def.value = '';
-      def.textContent = '（既定のマイク）';
-      els.setDevice.append(def);
-      for (const d of devices) {
-        const o = doc.createElement('option');
-        o.value = d.deviceId;
-        o.textContent = d.label;
-        els.setDevice.append(o);
-      }
-      els.setDevice.value = devices.some((d) => d.deviceId === selectedId) ? selectedId : '';
+    /** @returns {Promise<boolean>} 正しい番号なら true、Esc なら false */
+    askPin(expected) {
+      return new Promise((resolve) => {
+        modalOpen = true;
+        els.pin.hidden = false;
+        els.pinInput.value = '';
+        els.pinError.textContent = '';
+        els.pinInput.focus();
+        const close = (ok) => {
+          modalOpen = false;
+          els.pin.hidden = true;
+          els.pinInput.blur();
+          els.pinForm.removeEventListener('submit', onSubmit);
+          doc.defaultView.removeEventListener('keydown', onKey, true);
+          resolve(ok);
+        };
+        const onSubmit = (e) => {
+          e.preventDefault();
+          if (els.pinInput.value === expected) {
+            close(true);
+          } else {
+            els.pinError.textContent = '暗証番号が ちがいます';
+            els.pinInput.value = '';
+          }
+        };
+        const onKey = (e) => {
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            close(false);
+          } else {
+            e.stopImmediatePropagation(); // 入力中のキーをアプリ側（Space=スタンバイなど）に渡さない
+          }
+        };
+        els.pinForm.addEventListener('submit', onSubmit);
+        doc.defaultView.addEventListener('keydown', onKey, true);
+      });
     },
 
-    // ---- 確認モーダル（alert/confirm の代替） ----
+    // ---- 確認ダイアログ（alert/confirm の代替） ----
     isModalOpen() {
       return modalOpen;
     },
@@ -291,6 +389,7 @@ export function createRenderer(doc = document) {
     confirm({ title, message, okLabel = 'OK', cancelLabel = 'キャンセル' }) {
       return new Promise((resolve) => {
         modalOpen = true;
+        const prevFocus = doc.activeElement;
         els.modalTitle.textContent = title;
         els.modalMessage.textContent = message;
         els.modalOk.textContent = okLabel;
@@ -304,6 +403,7 @@ export function createRenderer(doc = document) {
           doc.defaultView.removeEventListener('keydown', onKey, true);
           els.modalOk.removeEventListener('click', onOk);
           els.modalCancel.removeEventListener('click', onCancel);
+          if (prevFocus && prevFocus !== doc.body && typeof prevFocus.focus === 'function') prevFocus.focus();
           resolve(result);
         };
         const onOk = () => close(true);
@@ -314,12 +414,12 @@ export function createRenderer(doc = document) {
             e.preventDefault();
             e.stopImmediatePropagation();
             close(false);
-          } else if (e.key === 'Tab') {
+          } else if (e.key === 'Tab' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
             e.preventDefault();
             e.stopImmediatePropagation();
             (doc.activeElement === els.modalOk ? els.modalCancel : els.modalOk).focus();
-          } else if (e.code === 'Space') {
-            e.stopImmediatePropagation(); // フォーカス中ボタンの標準動作に任せ、アプリ側には渡さない
+          } else {
+            e.stopImmediatePropagation(); // Enter/Space はフォーカス中ボタンの標準動作に任せる
           }
         };
         els.modalOk.addEventListener('click', onOk);

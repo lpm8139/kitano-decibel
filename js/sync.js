@@ -49,6 +49,8 @@ export function sameRecords(a, b) {
 // ---------------------------------------------------------------------------
 
 const TIMEOUT_MS = 4000;
+/** 保存（POST）の待ち時間。1日分の記録が多いと PowerShell 版は数秒かかるので長めに。 */
+const SAVE_TIMEOUT_MS = 30000;
 
 export class SyncClient {
   /**
@@ -73,7 +75,7 @@ export class SyncClient {
 
   async request(path, { method = 'GET', body } = {}) {
     const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    const t = setTimeout(() => ctrl.abort(), method === 'GET' ? TIMEOUT_MS : SAVE_TIMEOUT_MS);
     try {
       const res = await this.fetch(path, {
         method,
@@ -121,9 +123,16 @@ export class SyncClient {
     return this.request('/api/settings');
   }
 
-  /** その日の全記録を送信キューへ（同じ日付は最新で上書き）。 */
+  /**
+   * 記録を送信キューへ。サーバーは「届いた分」と「ファイルの分」をマージして保存するので、
+   * 変わった記録だけ送ればよい（1日分を毎回送ると、記録が増えるほど重くなる）。
+   * 送れていない分は同じ日付どうしでまとめる（新しい方が勝つ）。
+   */
   queueRecords(dateKey, records) {
-    this.pending.set(`records:${dateKey}`, { url: `/api/records/${dateKey}`, body: records, dateKey });
+    const key = `records:${dateKey}`;
+    const prev = this.pending.get(key);
+    const body = prev ? mergeRecords(prev.body, records) : [...records];
+    this.pending.set(key, { url: `/api/records/${dateKey}`, body, dateKey });
     this.emit();
     return this.flush();
   }

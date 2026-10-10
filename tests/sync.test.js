@@ -95,7 +95,7 @@ test('SyncClient: サーバー停止中は保持し、復帰後の再送で保�
   const statuses = [];
   const c = new SyncClient({ fetchImpl: srv.fetch, onStatus: (s) => statuses.push(s), retryMs: 20 });
   await c.queueRecords('2026-10-10', [rec('a', 1)]);
-  await c.queueRecords('2026-10-10', [rec('a', 1), rec('b', 2)]); // 同じ日付は最新で上書き
+  await c.queueRecords('2026-10-10', [rec('a', 1), rec('b', 2)]); // 同じ日付はまとめる（新しい方が勝つ）
   assert.equal(c.pending.size, 1);
   assert.equal(c.online, false);
   srv.up = true;
@@ -114,4 +114,19 @@ test('SyncClient: health で保存先パスを取得', async () => {
   srv.up = false;
   assert.equal(await c.health(), null);
   assert.equal(c.online, false);
+});
+
+test('SyncClient: 停止中に別々に積んだ記録はまとめて送られる（差分だけ送っても欠けない）', async () => {
+  const srv = fakeServer();
+  srv.up = false;
+  const c = new SyncClient({ fetchImpl: srv.fetch, retryMs: 20 });
+  await c.queueRecords('2026-10-10', [rec('a', 1)]);
+  await c.queueRecords('2026-10-10', [rec('b', 2)]);
+  await c.queueRecords('2026-10-10', [{ ...rec('a', 1), name: 'たろう', updatedAt: 99 }]);
+  assert.equal(c.pending.size, 1);
+  srv.up = true;
+  await new Promise((r) => setTimeout(r, 80));
+  const saved = srv.store['2026-10-10'];
+  assert.deepEqual(saved.map((r) => r.id), ['a', 'b']);
+  assert.equal(saved[0].name, 'たろう');
 });

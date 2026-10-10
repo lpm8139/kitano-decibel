@@ -1,118 +1,147 @@
 // app.js
-// 状態遷移（待機 → スタンバイ → 計測中 → 結果 → 待機）とイベント配線。
-// 計算は scoring.js、保存は storage.js、音声は audio.js、描画は render.js に任せる。
+// 状態遷移とイベント配線。
+//   待機(idle) → スタンバイ(standby) → ステージ1(stage1) → [ブースター(booster)] → エンドレス(endless) → 結果(result)
+// ゲームのルールは game.js、保存は storage.js / sync.js、音声入力は audio.js、
+// 画面は render.js / world.js、音は sound.js、管理者画面は admin.js に任せる。
 
-import {
-  CLIP_DBFS,
-  computeScore,
-  cumulativeProgress,
-  laneScale,
-  leadState,
-  progressAt,
-  referenceProgress,
-  roundTo1,
-  seriesToDbs,
-  totalProgress,
-} from './scoring.js';
+import { CLIP_DBFS } from './scoring.js';
 import * as store from './storage.js';
 import { MicMeter, listAudioInputs } from './audio.js';
 import { createRenderer } from './render.js';
-import { SyncClient, activeRecords, mergeRecords, sameRecords } from './sync.js';
+import { SyncClient, activeRecords, mergeRecords, recordStamp, sameRecords } from './sync.js';
+import { RocketRun, altitudeAt, isRankable, landmarksFor, nextLandmark, reachedLandmark } from './game.js';
+import { SoundSystem } from './sound.js';
+import { createAdmin } from './admin.js';
 
 /** スタンバイ中に反応がなければ待機へ戻るまでの時間（ms）。 */
 const STANDBY_TIMEOUT_MS = 15000;
+/** スタンバイ直後はしきい値を見ない時間（ms）。スタンバイ音や BGM の消え残りで誤って始まらないように。 */
+const ARM_DELAY_MS = 500;
 /** クリップ警告を出し続ける時間（ms）。 */
 const CLIP_HOLD_MS = 2000;
-/** 逆転演出を出す最小差（レーン満タン基準の割合）。序盤の揺らぎで連発しないため。 */
-const ANNOUNCE_MIN_DIFF_RATIO = 0.03;
+/** マイクのサンプルがこれ以上来ないときは、時間だけ進める（ms）。 */
+const STALL_MS = 250;
 /** 保存サーバーの死活確認の間隔（ms）。つながっていない間は短く。 */
 const HEALTH_ONLINE_MS = 10000;
 const HEALTH_OFFLINE_MS = 5000;
 
-const S = { IDLE: 'idle', STANDBY: 'standby', MEASURING: 'measuring', RESULT: 'result' };
+const S = { IDLE: 'idle', STANDBY: 'standby', STAGE1: 'stage1', BOOSTER: 'booster', ENDLESS: 'endless', RESULT: 'result' };
+const RUNNING = new Set([S.STAGE1, S.BOOSTER, S.ENDLESS]);
+
+const C = { yellow: '#FFD166', cyan: '#8ED6FF', white: '#FFFFFF', green: '#7CF29C', lilac: '#E2A7FF', pink: '#FF7AE0' };
+const fmtKm = (n) => Math.round(n).toLocaleString('ja-JP');
 
 const ui = createRenderer(document);
+const sound = new SoundSystem();
 
 let settings = store.loadSettings();
 let dateKey = store.localDateKey();
-// allRecords: 破棄済み（deleted）も含む全記録。保存・同期はこちら。
-// records   : 表示・ランキング・ゴーストに使う有効な記録だけ。
-let allRecords = store.loadRecords(dateKey);
-let records = activeRecords(allRecords);
+// allRecords: 破棄済み（deleted）・リハーサル・旧形式も含む全記録。保存・同期はこちら。
+// records   : ランキング・ゴーストに使う記録だけ（isRankable）。
+let allRecords = [];
+let records = [];
+setAll(store.loadRecords(dateKey));
 
 let state = S.IDLE;
-let currentDb = null; // 直近の表示dB
+let currentDb = null;
 let standbyStart = 0;
-let run = null; // 計測中のデータ { startAt, duration, samples, ghost, clipped, lastLead, reference }
-let lastRecordId = null; // 直近に保存した記録（結果画面で名前を付ける対象）
+let run = null; // RocketRun
+let ctx = null; // 1回分の表示用の情報 { ghost, clipped, lastSampleAt, dispAlt, leading, wasBehind, passed }
+let lastRecord = null; // 直近の記録（結果画面で名前を付ける対象）
 let clipUntil = 0;
 let micOk = false;
 let micMessage = 'マイクを準備しています…';
-let initialSynced = false; // サーバーと最初の突き合わせが済んだか
+let initialSynced = false;
 let settingsDirty = false; // 最初の突き合わせ前にこの画面で設定を変えたか（変えていればこちらを優先）
+let lastFrame = performance.now();
+let snapCamera = true;
 
 // ---------------------------------------------------------------------------
 // 記録まわり
 // ---------------------------------------------------------------------------
 
-/** 日付をまたいだら（深夜0時など）、その日の記録に切り替える。計測中・結果表示中は触らない。 */
-function syncDate() {
-  const key = store.localDateKey();
-  if (key !== dateKey) {
-    dateKey = key;
-    setAll(store.loadRecords(dateKey));
-    refreshBoard();
-    if (sync.online) {
-      pullDay(dateKey)
-        .then(() => store.pruneOtherDays(dateKey))
-        .catch(() => {});
-    }
-  }
-}
-
 function setAll(next) {
   allRecords = next;
-  records = activeRecords(next);
+  records = activeRecords(next).filter(isRankable);
 }
 
 function refreshBoard(highlightId = null) {
-  ui.renderTop10(records, highlightId);
-  ui.renderBest(store.bestRecord(records));
+  ui.renderRanking(records, highlightId);
 }
 
-/** ブラウザ内（localStorage）とPCのファイル（保存サーバー経由）の両方に保存する。 */
-function persist() {
-  store.saveRecords(dateKey, allRecords); // 失敗してもファイル側に送るので止めない
-  sync.queueRecords(dateKey, allRecords);
+/** ブラウザ内の控え。入りきらなければ、1位以外の履歴を省いた軽い形で残す（本体は PC のファイル）。 */
+function mirrorLocal() {
+  if (store.saveRecords(dateKey, allRecords)) return;
+  const best = store.bestRecord(records);
+  const compact = allRecords.map((r) => (best && r.id === best.id ? r : { ...r, series: [], alt: [] }));
+  store.saveRecords(dateKey, compact);
 }
+
+/** 変わった記録を、ブラウザ内（localStorage）と PC のファイル（保存サーバー経由）の両方に保存する。 */
+function persist(changed) {
+  mirrorLocal();
+  sync.queueRecords(dateKey, changed);
+}
+
+/** 日付をまたいだら（深夜0時など）、その日の記録に切り替える。計測中・結果表示中は呼ばない。 */
+function syncDate() {
+  const key = store.localDateKey();
+  if (key === dateKey) return;
+  dateKey = key;
+  setAll(store.loadRecords(dateKey));
+  refreshBoard();
+  if (sync.online) {
+    pullDay(dateKey)
+      .then(() => store.pruneOtherDays(dateKey))
+      .catch(() => {});
+  }
+}
+
+/** 今日の1位（ゴースト）。高さの履歴を持つ記録だけ。 */
+function ghostRecord() {
+  if (!settings.ghost) return null;
+  const best = store.bestRecord(records);
+  return best && Array.isArray(best.alt) && best.alt.length > 1 ? best : null;
+}
+
+// ---------------------------------------------------------------------------
+// 見た目の設定を反映
+// ---------------------------------------------------------------------------
+
+function applyLook() {
+  ui.setTheme(settings.theme);
+  ui.setRehearsal(settings.rehearsal);
+  ui.setThresholdMark(settings.threshold);
+  ui.world.build(settings);
+  sound.configure(settings);
+}
+
+const placeName = (key) => landmarksFor(settings).find((m) => m.key === key)?.name ?? '';
 
 // ---------------------------------------------------------------------------
 // 状態遷移
 // ---------------------------------------------------------------------------
 
-function idleMessage() {
-  if (!micOk) return { text: micMessage, tone: 'error' };
-  const best = store.bestRecord(records);
-  return {
-    text: best
-      ? `Space でスタンバイ ／ 本日ベスト ${best.score.toFixed(1)} を超えろ！`
-      : 'Space でスタンバイ ／ 最初のチャレンジャーを待っています',
-    tone: '',
-  };
-}
-
 function goIdle(notice = '') {
   syncDate();
   state = S.IDLE;
   run = null;
-  lastRecordId = null;
+  ctx = null;
+  lastRecord = null;
   ui.hideResult();
+  ui.clearEffects();
   ui.setState(S.IDLE);
-  ui.resetRace();
-  ui.setGhost(store.bestRecord(records));
-  ui.setTimerText(`計測 ${settings.duration} 秒`);
-  const m = idleMessage();
-  ui.setMessage(notice && micOk ? notice : m.text, notice && micOk ? '' : m.tone);
+  ui.setSide('howto', 'あそびかた');
+  ui.setTitles({ main: 'メインモニター：ロケット', status: 'マイク チェック' });
+  ui.setStageTimer(null);
+  ui.setEndlessBadge(false);
+  ui.world.resetGoals();
+  ui.setGhostOn(Boolean(ghostRecord()));
+  snapCamera = true;
+  sound.setRunActive(false);
+  refreshBoard();
+  if (!micOk) ui.setStrip(micMessage, 'error');
+  else ui.setStrip(notice || 'つぎの うちゅうひこうし、まってるよ！', notice ? 'yellow' : '');
 }
 
 function enterStandby() {
@@ -122,117 +151,195 @@ function enterStandby() {
   }
   syncDate();
   ui.hideResult();
+  ui.clearEffects();
   state = S.STANDBY;
   standbyStart = performance.now();
   run = null;
+  ctx = null;
   ui.setState(S.STANDBY);
-  ui.resetRace();
-  ui.setGhost(store.bestRecord(records));
-  ui.setMessage(`声を出すとスタート！（${settings.threshold} dB を超えたら計測開始）`);
+  ui.setSide('db', 'こえパワー（エンジン出力）');
+  ui.setTitles({ main: 'メインモニター：ロケット', status: 'スタンバイ' });
+  ui.world.resetGoals();
+  ui.setGhostOn(Boolean(ghostRecord()));
+  snapCamera = true;
+  sound.setRunActive(true); // BGM を消す
+  sound.se('standby');
+  ui.setStrip('こえを だすと はっしゃ！');
 }
 
-function startMeasuring(now, db) {
-  const best = store.bestRecord(records);
-  let ghost = null;
-  if (best) {
-    const cum = cumulativeProgress(best.series, settings.floor);
-    ghost = { record: best, cum, total: totalProgress(cum) };
+function startRun(now, db) {
+  const ghost = ghostRecord();
+  run = new RocketRun(settings);
+  ctx = { ghost, clipped: false, lastSampleAt: now, dispAlt: 0, leading: false, wasBehind: false, passed: new Set() };
+  state = S.STAGE1;
+  ui.setState(S.STAGE1);
+  ui.setGhostOn(Boolean(ghost));
+  ui.world.setGhostName(ghost ? `チャンピオン ${(ghost.name || 'ななし').slice(0, 8)}` : '');
+  ui.setSide('db', 'こえパワー（エンジン出力）');
+  ui.setTitles({ main: 'メインモニター：ロケット', status: 'ミッション じょうきょう' });
+  ui.setStrip('ステージ1：うちゅうへ むかって いるよ！');
+  seRun('launch');
+  handleEvents(run.start(now, db));
+}
+
+/** 計測中の効果音（マイクに入って dB が上がるので、設定でオンのときだけ）。 */
+function seRun(name) {
+  if (settings.seDuringRun) sound.se(name);
+}
+
+function handleEvents(events) {
+  for (const e of events) {
+    if (!run) return;
+    switch (e.type) {
+      case 'goal1':
+        ui.world.markGoalDone(1);
+        if (!e.boosted) {
+          ui.goalCard(1, placeName('space'));
+          seRun('goal');
+          ui.setStrip('つぎは ★つきを めざせ！', 'green');
+        }
+        break;
+      case 'goal2':
+        ui.world.markGoalDone(2);
+        break;
+      case 'booster':
+        state = S.BOOSTER;
+        ui.setState(S.BOOSTER);
+        ui.boosterPill(2800);
+        if (settings.cheerBoost) ui.setSide('cheer', 'おうえん メーター');
+        else ui.setSide('warp', 'ブースター');
+        ui.setCheer(null);
+        ui.setStrip('このあと ∞エンドレスモード！', 'pink');
+        sound.se('booster'); // ブースター中の声は記録に入らないので鳴らしてよい
+        break;
+      case 'endless':
+        state = S.ENDLESS;
+        ui.setState(S.ENDLESS);
+        ui.endlessPill(run.boosted ? '∞ エンドレスモード スタート！' : 'つきに とうちゃく！ ∞エンドレスへ！');
+        ui.setEndlessBadge(true);
+        ui.setSide('db', 'こえパワー（エンジン出力）');
+        ui.setTitles({ main: 'メインモニター：エンドレス' });
+        ui.setStrip('こえが とぎれたら おわり！ とびつづけろ！', 'pink');
+        seRun('endless');
+        break;
+      case 'end':
+        finishRun();
+        return;
+      default:
+        break;
+    }
   }
-  run = {
-    startAt: now,
-    duration: settings.duration,
-    samples: [],
-    ghost,
-    clipped: false,
-    lastLead: null,
-    reference: referenceProgress(settings.floor, settings.duration),
-  };
-  state = S.MEASURING;
-  ui.setState(S.MEASURING);
-  ui.setMessage('声を出し続けろ！');
-  ui.setGhost(best);
-  pushSample(now, db);
 }
 
-function pushSample(now, db) {
-  const t = Math.max(0, Math.round(now - run.startAt));
-  if (t > run.duration * 1000) return; // 規定時間を超えたサンプルは記録しない
-  run.samples.push([t, roundTo1(db)]);
-  updateRace();
-}
-
-/** 挑戦者とゴーストを「挑戦者の最新サンプル時刻」で比較して描画する。 */
-function updateRace() {
-  const cum = cumulativeProgress(run.samples, settings.floor);
-  const last = cum[cum.length - 1];
-  const you = last.p;
-  const ghostP = run.ghost ? progressAt(run.ghost.cum, last.t) : null;
-  const scale = laneScale({
-    ghostTotal: run.ghost ? run.ghost.total : null,
-    current: you,
-    reference: run.reference,
-  });
-  const lead = ghostP === null ? 'solo' : leadState(you, ghostP);
-  ui.renderRace({ you, ghost: ghostP, scale, lead });
-
-  if (ghostP !== null && Math.abs(you - ghostP) > scale * ANNOUNCE_MIN_DIFF_RATIO) {
-    if (run.lastLead === 'behind' && lead === 'lead') ui.announce('逆転！', 'lead');
-    else if (run.lastLead === 'lead' && lead === 'behind') ui.announce('抜かれた！', 'behind');
-    run.lastLead = lead;
-  }
-}
-
-function finishMeasuring() {
-  const samples = run.samples;
-  const score = computeScore(seriesToDbs(samples), settings.scoreMethod);
-  if (score === null) {
-    goIdle('計測に失敗しました');
-    return;
-  }
+function finishRun() {
+  const res = run.result();
   const prevBest = store.bestRecord(records);
   const ts = Date.now();
   const record = {
     id: store.newRecordId(),
     name: '',
-    score,
-    method: settings.scoreMethod,
-    duration: run.duration,
     ts,
     updatedAt: ts,
-    clipped: run.clipped,
-    series: samples,
+    clipped: ctx.clipped,
+    rehearsal: settings.rehearsal,
+    // その回の難易度（あとで調整の参考にする）
+    cfg: {
+      offset: settings.offset,
+      floor: settings.floor,
+      kmRate: settings.kmRate,
+      threshold: settings.threshold,
+      goal1Km: settings.goal1Km,
+      goal2Km: settings.goal2Km,
+      stage1Sec: settings.stage1Sec,
+      endlessMaxSec: settings.endlessMaxSec,
+      silenceEndSec: settings.silenceEndSec,
+      booster: settings.booster,
+    },
+    ...res,
   };
+  const reached = { ...run.reached };
   setAll([...allRecords, record]);
-  persist(); // 名前入力前に先に保存（途中で閉じても記録が残る）
-  lastRecordId = record.id;
+  persist([record]); // 名前を入れる前に先に保存（途中で閉じても記録が残る）
+  lastRecord = record;
   run = null;
 
+  const rankable = isRankable(record);
+  const isNewRecord = rankable && (!prevBest || record.score > prevBest.score);
+  const rank = rankable ? store.rankOf(records, record.id) : 0;
+  const place = reachedLandmark(record.score, landmarksFor(settings));
+
   state = S.RESULT;
-  const isNewRecord = !prevBest || score > prevBest.score;
   ui.setState(S.RESULT);
+  ui.setStageTimer(null);
+  ui.setEndlessBadge(false);
+  ui.clearEffects();
+  sound.setRunActive(false);
+  sound.se(isNewRecord ? 'newRecord' : 'result');
   ui.showResult({
-    score,
-    rank: store.rankOf(records, record.id),
-    total: records.length,
+    score: record.score,
+    place,
+    reached,
+    boosted: record.boosted,
+    beyondMoon: place.km > settings.goal2Km,
     isNewRecord,
   });
+  ui.setTitles({ main: isNewRecord ? 'ミッション だいせいこう！！' : 'ミッション せいこう！', status: 'けっか' });
+  ui.setCells([
+    { k: 'とどいた たかさ', v: `${fmtKm(record.score)} km`, color: C.yellow, size: 56 },
+    { k: 'へいきんの こえ', v: Number.isFinite(record.meanDb) ? `${record.meanDb.toFixed(1)} dB` : '--', color: C.cyan, size: 50 },
+    { k: 'きょうの じゅんい', v: rankable ? `${rank} い` : 'リハーサル', color: isNewRecord ? C.yellow : C.white, size: rankable ? 56 : 40 },
+  ]);
+  if (settings.nameInput) {
+    ui.setSide('name', 'なまえ にゅうりょく');
+    ui.focusName('');
+  } else {
+    ui.setSide('score', isNewRecord ? 'しんきろく' : 'けっか');
+  }
+  ui.setStrip(isNewRecord ? '「しんきろく、かくにん！！」' : 'ミッション せいこう！ おつかれさま！', isNewRecord ? 'yellow' : 'green');
+  if (isNewRecord) {
+    ui.flash();
+    ui.confetti();
+  }
   refreshBoard(record.id);
-  if (isNewRecord) ui.flash();
 }
 
 /** 結果画面を閉じる前に、入力された名前を保存する。 */
 function commitResult() {
-  const name = store.normalizeName(ui.getResultName());
-  if (lastRecordId && name) {
-    setAll(store.renameRecord(allRecords, lastRecordId, name));
-    persist();
+  if (!lastRecord) return;
+  const name = settings.nameInput ? store.normalizeName(ui.getResultName()) : '';
+  if (name) {
+    setAll(store.renameRecord(allRecords, lastRecord.id, name));
+    const renamed = allRecords.find((r) => r.id === lastRecord.id);
+    if (renamed) persist([renamed]);
     refreshBoard();
   }
-  ui.hideResult();
+  lastRecord = null;
 }
 
-function abort() {
-  if (state === S.STANDBY || state === S.MEASURING) goIdle('中断しました');
+function abortRun() {
+  if (state === S.STANDBY || RUNNING.has(state)) {
+    sound.se('abort');
+    goIdle(state === S.STANDBY ? '' : 'ちゅうだん しました（きろくは のこりません）');
+  }
+}
+
+async function discardResult() {
+  if (state !== S.RESULT || !lastRecord) return;
+  const id = lastRecord.id;
+  const ok = await ui.confirm({
+    title: 'この記録を破棄',
+    message: '今回の記録をランキングから外します（PCのファイルには破棄済みとして残ります）。よろしいですか？',
+    okLabel: '破棄する',
+  });
+  if (!ok) {
+    if (settings.nameInput) ui.els.resultName.focus();
+    return;
+  }
+  setAll(store.markDeleted(allRecords, id));
+  const deleted = allRecords.find((r) => r.id === id);
+  if (deleted) persist([deleted]);
+  lastRecord = null;
+  goIdle('きろくを はき しました');
 }
 
 // ---------------------------------------------------------------------------
@@ -244,19 +351,21 @@ const mic = new MicMeter({ onSample, onStatus: onMicStatus });
 function onSample({ dbfs, peakDbfs, now }) {
   const db = dbfs + settings.offset;
   currentDb = db;
-  ui.setDb(db, dbfs);
+  ui.setDb(db);
+  admin.setLive(dbfs);
 
   if (peakDbfs >= CLIP_DBFS) {
     clipUntil = now + CLIP_HOLD_MS;
     ui.setClip(true);
-    if (run) run.clipped = true;
+    if (ctx) ctx.clipped = true;
   }
 
   if (state === S.STANDBY) {
-    if (db >= settings.threshold) startMeasuring(now, db); // しきい値を超えた瞬間に開始
-  } else if (state === S.MEASURING) {
-    pushSample(now, db);
-    if (now - run.startAt >= run.duration * 1000) finishMeasuring(); // rAF が止まっても終わらせる
+    if (now - standbyStart >= ARM_DELAY_MS && db >= settings.threshold) startRun(now, db); // しきい値を超えた瞬間に開始
+  } else if (run && RUNNING.has(state)) {
+    ctx.lastSampleAt = now;
+    if (state === S.BOOSTER) ui.setCheer(db);
+    handleEvents(run.update(now, db));
   }
 }
 
@@ -277,12 +386,12 @@ function onMicStatus({ status, message, label, fellBack }) {
     ui.setMicStatus('マイクエラー', 'error');
     ui.setDb(null);
   }
-  if (state !== S.RESULT) goIdle(); // 結果表示中は結果を消さない
+  if (state !== S.RESULT && !admin.isOpen()) goIdle(); // 結果表示中は結果を消さない
 }
 
 async function refreshDevices() {
   try {
-    ui.fillDevices(await listAudioInputs(), settings.deviceId);
+    admin.setInfo({ devices: await listAudioInputs() });
   } catch {
     /* 一覧が取れなくても動作には影響しない */
   }
@@ -291,37 +400,69 @@ async function refreshDevices() {
 async function startMic() {
   ui.setMicStatus('マイク準備中…', 'pending');
   await mic.start(settings.deviceId);
-  await refreshDevices(); // 権限取得後でないとデバイス名が取れない
+  if (admin.isOpen()) await refreshDevices(); // 権限取得後でないとデバイス名が取れない
 }
 
 // ---------------------------------------------------------------------------
-// 設定
+// 管理者画面
 // ---------------------------------------------------------------------------
 
-function openSettings() {
-  if (state !== S.IDLE) {
-    ui.toast('設定は待機中に開けます（Esc で中断してから）');
+const admin = createAdmin(ui.els.admin, {
+  onSave: saveAdmin,
+  onCancel: closeAdmin,
+  onCsv: exportCsv,
+  onReset: resetRecords,
+  onTestSe: (name) => {
+    sound.unlock();
+    if (!sound.se(name)) ui.toast('効果音がオフか、まだ鳴らせません');
+  },
+  onNextBgm: () => {
+    sound.unlock();
+    if (!sound.files.length) ui.toast('sound フォルダに音楽ファイルがありません');
+    else if (!settings.bgm) ui.toast('BGM がオフです（オンにして保存すると流れます）');
+    else sound.next();
+  },
+});
+
+async function requestAdmin() {
+  if (admin.isOpen() || ui.isModalOpen()) return;
+  if (state === S.STANDBY || RUNNING.has(state)) {
+    ui.toast('計測中は開けません（Esc で中断してから）');
     return;
   }
-  ui.fillSettings(settings);
+  if (state === S.RESULT) {
+    commitResult();
+    goIdle();
+  }
+  const ok = await ui.askPin(settings.adminPin);
+  if (!ok || state !== S.IDLE) return;
+  admin.open(settings, {
+    dataDir: sync.dataDir,
+    syncText: syncText(),
+    recordCount: records.length,
+    sounds: sound.files,
+  });
   refreshDevices();
-  ui.openSettings();
+  sound.loadPlaylist().then((files) => admin.setInfo({ sounds: files }));
 }
 
-function applySettings() {
-  const next = store.normalizeSettings(ui.readSettings());
+function saveAdmin(raw) {
+  const next = store.normalizeSettings({ ...settings, ...raw });
   const deviceChanged = next.deviceId !== settings.deviceId;
+  const pinChanged = next.adminPin !== settings.adminPin;
   settings = next;
   if (!initialSynced) settingsDirty = true;
   store.saveSettings(settings);
   sync.queueSettings(settings);
-  ui.fillSettings(settings); // 範囲外の値を丸めた結果を入力欄に反映
+  admin.close();
+  applyLook();
   if (deviceChanged) startMic();
+  goIdle();
+  ui.toast(pinChanged ? '設定を保存しました（暗証番号を変更しました）' : '設定を保存しました');
 }
 
-function closeSettings() {
-  applySettings();
-  ui.closeSettings();
+function closeAdmin() {
+  admin.close();
   goIdle();
 }
 
@@ -347,34 +488,18 @@ function exportCsv() {
 }
 
 async function resetRecords() {
-  if (state !== S.IDLE && state !== S.RESULT) {
-    ui.toast('リセットは待機中に行えます');
-    return;
-  }
   const ok = await ui.confirm({
     title: '本日の記録をリセット',
     message: `本日（${dateKey}）の記録 ${records.length} 件をランキングから外します。PCの data フォルダのファイルには残るので、あとから復旧できます。`,
     okLabel: 'リセットする',
   });
   if (!ok) return;
+  const before = new Set(allRecords.filter((r) => !r.deleted).map((r) => r.id));
   setAll(store.markAllDeleted(allRecords));
-  persist();
+  persist(allRecords.filter((r) => before.has(r.id)));
   refreshBoard();
-  goIdle('本日の記録をリセットしました');
-}
-
-async function discardResult() {
-  if (state !== S.RESULT || !lastRecordId) return;
-  const ok = await ui.confirm({
-    title: 'この記録を破棄',
-    message: '今回の記録をランキングから外します（PCのファイルには破棄済みとして残ります）。よろしいですか？',
-    okLabel: '破棄する',
-  });
-  if (!ok) return;
-  setAll(store.markDeleted(allRecords, lastRecordId));
-  persist();
-  refreshBoard();
-  goIdle('記録を破棄しました');
+  admin.setInfo({ recordCount: records.length });
+  ui.toast('本日の記録をリセットしました');
 }
 
 async function toggleFullscreen() {
@@ -409,7 +534,7 @@ function onSpace() {
       enterStandby();
       break;
     case S.STANDBY:
-      startMeasuring(performance.now(), currentDb ?? 0); // 手動で即開始
+      startRun(performance.now(), currentDb ?? settings.threshold); // 手動で即開始
       break;
     case S.RESULT:
       commitResult();
@@ -420,51 +545,80 @@ function onSpace() {
   }
 }
 
+function backToIdleFromResult() {
+  commitResult();
+  goIdle();
+}
+
 document.addEventListener('keydown', (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return;
-  if (ui.isModalOpen()) return; // モーダルが自前で処理する
+  sound.unlock();
   mic.resume(); // 自動再生ポリシーで止まっていたマイクをユーザー操作で再開
+  if (ui.isModalOpen()) return; // ダイアログが自前で処理する
 
-  const target = e.target;
-  const inField = target instanceof HTMLElement && target.matches('input, select, textarea');
-
-  if (ui.isSettingsOpen()) {
-    if (e.code === 'Escape' || (!inField && e.code === 'KeyS')) {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyA') {
+    e.preventDefault();
+    requestAdmin();
+    return;
+  }
+  if (admin.isOpen()) {
+    if (e.key === 'Escape') {
       e.preventDefault();
-      closeSettings();
+      closeAdmin();
     }
     return;
   }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.isComposing || e.keyCode === 229) return; // 日本語入力の変換中
+
+  const nameField = ui.els.resultName;
+  if (state === S.RESULT && e.target === nameField) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      backToIdleFromResult();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      nameField.value = '';
+      backToIdleFromResult();
+    } else if (nameField.value === '' && e.code === 'Space') {
+      e.preventDefault(); // 名前が空なら Space で次の人へ
+      onSpace();
+    } else if (nameField.value === '' && e.key === 'Delete') {
+      e.preventDefault();
+      discardResult();
+    }
+    return; // それ以外は名前の入力
+  }
+  if (e.target instanceof HTMLElement && e.target.matches('input, select, textarea')) return;
   if (e.repeat) return;
 
   switch (e.code) {
-    case 'Escape':
-      if (state === S.RESULT) {
-        commitResult();
-        goIdle();
-      } else {
-        abort();
-      }
-      break;
     case 'Space':
-      if (inField) return; // 名前入力中のスペースはそのまま入力
       e.preventDefault();
       onSpace();
       break;
-    case 'KeyF':
-      if (inField) return;
-      toggleFullscreen();
+    case 'Escape':
+      if (state === S.RESULT) backToIdleFromResult();
+      else abortRun();
       break;
-    case 'KeyS':
-      if (inField) return;
-      openSettings();
+    case 'Enter':
+    case 'NumpadEnter':
+      if (state === S.RESULT) backToIdleFromResult();
+      break;
+    case 'Delete':
+      if (state === S.RESULT) discardResult();
+      break;
+    case 'KeyF':
+      toggleFullscreen();
       break;
     default:
       break;
   }
 });
 
-document.addEventListener('pointerdown', () => mic.resume());
+document.addEventListener('pointerdown', () => {
+  sound.unlock();
+  mic.resume();
+});
 
 // ボタンにフォーカスが残ると Space で再クリックされるので、クリック後に外す
 document.addEventListener('click', (e) => {
@@ -472,53 +626,130 @@ document.addEventListener('click', (e) => {
   if (btn) btn.blur();
 });
 
-ui.els.btnCsv.addEventListener('click', exportCsv);
-ui.els.btnSettings.addEventListener('click', openSettings);
-ui.els.btnReset.addEventListener('click', resetRecords);
-ui.els.btnSettingsClose.addEventListener('click', closeSettings);
-ui.els.btnResultDiscard.addEventListener('click', discardResult);
-ui.els.resultForm.addEventListener('submit', (e) => {
-  e.preventDefault(); // Enter または「決定」ボタン
-  if (state !== S.RESULT) return;
-  commitResult();
-  goIdle();
-});
-for (const el of [
-  ui.els.setDevice,
-  ui.els.setDuration,
-  ui.els.setThreshold,
-  ui.els.setFloor,
-  ui.els.setOffset,
-  ui.els.setMethod,
-]) {
-  el.addEventListener('change', applySettings);
-}
-navigator.mediaDevices?.addEventListener?.('devicechange', refreshDevices);
+ui.els.btnAdmin.addEventListener('click', requestAdmin);
+ui.els.btnDiscard.addEventListener('click', discardResult);
+window.addEventListener('resize', () => ui.fit());
+navigator.mediaDevices?.addEventListener?.('devicechange', () => admin.isOpen() && refreshDevices());
 
 // ---------------------------------------------------------------------------
-// フレームループ（残り時間表示・タイムアウト・クリップ表示解除）
+// フレームループ（ロケットの位置・残り時間・状況表示）
 // ---------------------------------------------------------------------------
 
 function frame(now) {
   requestAnimationFrame(frame);
+  const dt = Math.min(0.1, Math.max(0, (now - lastFrame) / 1000));
+  lastFrame = now;
 
   if (state === S.STANDBY) {
     const left = STANDBY_TIMEOUT_MS - (now - standbyStart);
     if (left <= 0) {
-      goIdle('スタンバイが時間切れになりました');
+      goIdle('スタンバイが じかんぎれに なりました');
     } else {
-      ui.setTimerText(`計測 ${settings.duration} 秒 ／ あと ${Math.ceil(left / 1000)} 秒で待機に戻ります`);
+      ui.setCells([
+        { k: 'いまの こえ', v: currentDb === null ? '--' : `${currentDb.toFixed(1)} dB`, color: C.cyan, size: 52 },
+        { k: 'はっしゃ する こえ', v: `${settings.threshold} dB いじょう`, color: C.yellow, size: 40 },
+        { k: 'たいきに もどるまで', v: `${Math.ceil(left / 1000)} びょう`, color: C.white, size: 44 },
+      ]);
     }
-  } else if (state === S.MEASURING) {
-    const elapsed = now - run.startAt;
-    const total = run.duration * 1000;
-    ui.setTimerText(`残り ${Math.max(0, (total - elapsed) / 1000).toFixed(1)} 秒`);
-    if (elapsed >= total) finishMeasuring();
+  }
+
+  if (run && RUNNING.has(state)) {
+    // マイクのサンプルが途切れても（タブの一時停止など）時間は進める
+    if (now - ctx.lastSampleAt > STALL_MS) {
+      handleEvents(run.update(now, null));
+    }
+  }
+
+  if (run && RUNNING.has(state)) {
+    ctx.dispAlt += (run.alt - ctx.dispAlt) * (1 - Math.exp(-dt / 0.08));
+    const alt = ctx.dispAlt;
+    const ghostAlt = ctx.ghost ? altitudeAt(ctx.ghost.alt, now - run.t0) : null;
+    const thrust = currentDb === null ? 0.3 : Math.min(1.6, Math.max(0.25, (currentDb - settings.floor) / 30));
+    ui.world.update({ alt, ghostAlt, thrust, dt, snap: snapCamera });
+    snapCamera = false;
+    trackMoments(alt, ghostAlt);
+    renderRunStatus(now, alt, ghostAlt);
+  } else if (state === S.IDLE || state === S.STANDBY) {
+    ui.world.update({ alt: 0, ghostAlt: null, thrust: 0.3, dt, snap: snapCamera });
+    snapCamera = false;
+    if (state === S.IDLE) {
+      const best = store.bestRecord(records);
+      ui.setCells([
+        { k: 'いまの こえ', v: !micOk || currentDb === null ? '--' : `${currentDb.toFixed(1)} dB`, color: C.cyan, size: 56 },
+        { k: 'もくひょう', v: 'うちゅう・つき', color: C.yellow, size: 40 },
+        best ? { k: 'きょうの チャンピオン', v: `${fmtKm(best.score)} km`, color: C.lilac, size: 44 } : null,
+      ]);
+    }
   }
 
   if (clipUntil && now > clipUntil) {
     clipUntil = 0;
     ui.setClip(false);
+  }
+}
+
+/** チャンピオンを抜いた・星を通りすぎた、の演出。 */
+function trackMoments(alt, ghostAlt) {
+  if (ghostAlt !== null) {
+    if (alt < ghostAlt - 3) ctx.wasBehind = true;
+    const leading = alt > ghostAlt + 3;
+    if (leading && !ctx.leading && ctx.wasBehind) {
+      ui.pop('チャンピオンを ぬいた！', 'lead');
+      seRun('pass');
+    }
+    if (leading || alt < ghostAlt - 3) ctx.leading = leading;
+  }
+  if (state === S.ENDLESS) {
+    for (const m of landmarksFor(settings)) {
+      if (m.km > settings.goal2Km && alt >= m.km && !ctx.passed.has(m.key)) {
+        ctx.passed.add(m.key);
+        ui.pop(`${m.name} つうか！`);
+        seRun('pass');
+      }
+    }
+  }
+}
+
+function renderRunStatus(now, alt, ghostAlt) {
+  const marks = landmarksFor(settings);
+  if (state === S.STAGE1) {
+    const left = run.stageLeft(now) ?? 0;
+    ui.setStageTimer(left / settings.stage1Sec, `のこり ${left.toFixed(1)} びょう`);
+    const target = run.reached.goal1 ? settings.goal2Km : settings.goal1Km;
+    const targetName = run.reached.goal1 ? placeName('moon') : placeName('space');
+    ui.setCells([
+      { k: 'のこり', v: `${left.toFixed(1)} びょう`, color: C.cyan, size: 50 },
+      { k: 'たかさ', v: `${fmtKm(alt)} km`, color: C.white, size: 52 },
+      { k: `${targetName} まで`, v: `あと ${fmtKm(Math.max(0, target - alt))} km`, color: C.yellow, size: 46 },
+    ]);
+  } else if (state === S.BOOSTER) {
+    ui.setStageTimer(null);
+    ui.setCells([
+      { k: placeName('space'), v: 'クリア ✓', color: C.green, size: 46 },
+      { k: placeName('moon'), v: 'ワープちゅう', color: C.yellow, size: 46 },
+      { k: 'たかさ', v: `${fmtKm(alt)} km`, color: C.white, size: 46 },
+    ]);
+  } else if (state === S.ENDLESS) {
+    const el = run.endlessElapsed(now) ?? 0;
+    const left = Math.max(0, settings.endlessMaxSec - el);
+    ui.setStageTimer(left / settings.endlessMaxSec, `のこり ${left.toFixed(1)} びょう`);
+    let second;
+    if (ghostAlt !== null && ctx.ghost) {
+      const finalGhost = ctx.ghost.score;
+      second = alt > finalGhost
+        ? { k: 'チャンピオン', v: 'ぬいた！', color: C.yellow, size: 50 }
+        : { k: 'チャンピオンまで', v: `あと ${fmtKm(finalGhost - alt)} km`, color: C.lilac, size: 44 };
+    } else {
+      const next = nextLandmark(alt, marks);
+      second = next
+        ? { k: `${next.name} まで`, v: `あと ${fmtKm(next.km - alt)} km`, color: C.lilac, size: 44 }
+        : { k: 'つぎの ほし', v: 'どこまでも！', color: C.lilac, size: 44 };
+    }
+    ui.setCells([
+      { k: 'たかさ', v: `${fmtKm(alt)} km`, color: C.white, size: 54 },
+      second,
+      { k: 'のこり', v: `${left.toFixed(1)} びょう`, color: C.cyan, size: 44 },
+    ]);
   }
 }
 
@@ -528,31 +759,44 @@ function frame(now) {
 
 const sync = new SyncClient({ onStatus: onSyncStatus, onRecordsMerged });
 
+function syncText() {
+  if (!sync.online) return sync.pending.size ? '未保存あり・再送中' : '保存サーバー未接続';
+  if (!initialSynced) return '保存ファイルを読み込み中…';
+  return sync.pending.size ? 'ファイルに保存中…' : 'ファイルに保存済み ✓';
+}
+
 function onSyncStatus({ online, pending, dataDir }) {
   if (online && !initialSynced) {
     // つながった直後、保存ファイルの設定・記録を読み込み終わるまでは「保存済み」と出さない
     ui.setServerBanner(null);
-    ui.setSync('保存ファイルを読み込み中…', 'pending');
+    ui.setSync(syncText(), 'pending');
   } else if (online) {
     ui.setServerBanner(null);
-    ui.setSync(pending ? 'ファイルに保存中…' : 'ファイルに保存済み ✓', pending ? 'pending' : 'ok');
+    ui.setSync(syncText(), pending ? 'pending' : 'ok');
   } else {
     ui.setServerBanner(
-      '保存サーバーにつながりません。start.bat の黒いウィンドウが開いているか確認してください（計測は続けられます。つながったら自動で保存します）',
+      '保存サーバーにつながりません。start.bat の黒いウィンドウが開いているか確認してください（ゲームは続けられます。つながったら自動で保存します）',
     );
-    ui.setSync(pending ? '未保存あり・再送中' : '保存サーバー未接続', 'error');
+    ui.setSync(syncText(), 'error');
   }
-  ui.setDataDir(dataDir);
+  admin.setInfo({ dataDir, syncText: syncText() });
 }
 
-/** サーバー側でマージされた結果に、こちらに無い記録があれば取り込む。 */
+/**
+ * サーバー側でマージされた結果（その日のファイルの全件）を受け取ったとき:
+ *  ・こちらに無い記録があれば取り込む（別の画面で記録したものなど）
+ *  ・ファイル側に無い／古い記録があれば送り直す（ファイルが壊れて作り直された場合など）
+ */
 function onRecordsMerged(key, merged) {
   if (key !== dateKey) return;
+  const onFile = new Map(merged.map((r) => [r.id, recordStamp(r)]));
+  const missing = allRecords.filter((r) => !onFile.has(r.id) || onFile.get(r.id) < recordStamp(r));
+  if (missing.length) sync.queueRecords(key, missing);
   const next = mergeRecords(allRecords, merged);
   if (sameRecords(next, allRecords)) return;
   setAll(next);
-  store.saveRecords(dateKey, allRecords);
-  refreshBoard();
+  mirrorLocal();
+  refreshBoard(state === S.RESULT ? lastRecord?.id : null);
 }
 
 /** サーバーにある指定日の記録と突き合わせる。差があればお互いにそろえる。 */
@@ -562,9 +806,9 @@ async function pullDay(key) {
   const merged = mergeRecords(allRecords, remote);
   if (!sameRecords(merged, allRecords)) {
     setAll(merged);
-    store.saveRecords(dateKey, allRecords);
-    refreshBoard();
-    if (state === S.IDLE) goIdle(); // ゴースト・案内文を読み込んだ記録で更新
+    mirrorLocal();
+    refreshBoard(state === S.RESULT ? lastRecord?.id : null);
+    if (state === S.IDLE) ui.setGhostOn(Boolean(ghostRecord()));
   }
   if (!sameRecords(merged, remote)) await sync.queueRecords(key, allRecords);
 }
@@ -579,7 +823,7 @@ async function initialSync() {
       const deviceChanged = next.deviceId !== settings.deviceId;
       settings = next;
       store.saveSettings(settings);
-      ui.fillSettings(settings);
+      applyLook();
       if (deviceChanged) startMic();
       if (state === S.IDLE) goIdle();
     }
@@ -590,6 +834,7 @@ async function initialSync() {
   initialSynced = true;
   store.pruneOtherDays(dateKey); // ファイル側に保存済みなので、ブラウザの控えは当日分だけ残す
   sync.emit(); // 「読み込み中」→「保存済み」に表示を更新
+  sound.loadPlaylist();
   if (records.length) ui.toast(`保存ファイルから本日の記録 ${records.length} 件を読み込みました`, 3000);
 }
 
@@ -615,9 +860,28 @@ async function healthLoop() {
 
 ui.setServerBanner(null); // JS が動いた = start.bat 経由で開けている（file:// 直開きならこの行まで来ない）
 ui.setSync('保存サーバー確認中…', 'pending');
-ui.fillSettings(settings);
-refreshBoard();
+ui.fit();
+applyLook();
 goIdle();
 requestAnimationFrame(frame);
 startMic();
 healthLoop();
+
+// テスト（tests/e2e_scenarios.py）から状態を読むための窓口。ゲームの動きには関係しない。
+window.__kitano = {
+  get state() {
+    return state;
+  },
+  get alt() {
+    return run ? run.alt : null;
+  },
+  get settings() {
+    return settings;
+  },
+  get records() {
+    return allRecords;
+  },
+  get bgm() {
+    return { playing: sound.bgmPlaying, files: sound.files, runActive: sound.runActive };
+  },
+};

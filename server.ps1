@@ -3,7 +3,7 @@
 # Python が入っていない Windows PC 用の予備サーバー。Windows 標準の PowerShell 5.1 だけで動く。
 # server.py と同じ API・同じ保存形式（どちらで起動しても同じ data/ フォルダを使える）。
 #
-#   GET  /api/health / GET・POST /api/records/<YYYY-MM-DD> / GET・POST /api/settings
+#   GET  /api/health / GET・POST /api/records/<YYYY-MM-DD> / GET・POST /api/settings / GET /api/sounds
 #
 # 保存の仕組み（server.py と同じ）
 #   data/<日付>.json              … その日の全記録（tmp に書いてから置き換え＝途中で落ちても壊れない）
@@ -26,7 +26,7 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $HistoryKeep = 20
-$MaxBody = 5MB
+$MaxBody = 20MB
 $DateRe = '^\d{4}-\d{2}-\d{2}$'
 $script:LoggedIds = @{}
 
@@ -215,6 +215,22 @@ $ContentTypes = @{
   '.html' = 'text/html; charset=utf-8'; '.js' = 'text/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'
   '.json' = 'application/json; charset=utf-8'; '.svg' = 'image/svg+xml'; '.png' = 'image/png'; '.ico' = 'image/x-icon'
   '.md' = 'text/plain; charset=utf-8'; '.txt' = 'text/plain; charset=utf-8'; '.csv' = 'text/csv; charset=utf-8'
+  '.woff2' = 'font/woff2'; '.mp3' = 'audio/mpeg'; '.ogg' = 'audio/ogg'; '.wav' = 'audio/wav'; '.m4a' = 'audio/mp4'
+}
+
+# sound フォルダの音楽ファイル名（名前順）。BGM 用。
+function Get-SoundFiles {
+  $list = New-Object 'System.Collections.Generic.List[string]'
+  $dir = [System.IO.Path]::Combine($RootFull, 'sound')
+  if ([System.IO.Directory]::Exists($dir)) {
+    foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
+      $n = [string][System.IO.Path]::GetFileName($f)
+      $e = [System.IO.Path]::GetExtension($n).ToLowerInvariant()
+      if (-not $n.StartsWith('.') -and ($e -eq '.mp3' -or $e -eq '.ogg' -or $e -eq '.wav' -or $e -eq '.m4a')) { $list.Add($n) }
+    }
+  }
+  $list.Sort([System.StringComparer]::Ordinal)
+  return , $list.ToArray()
 }
 
 function Send-Bytes($ctx, [byte[]]$bytes, [string]$type, [int]$status = 200) {
@@ -294,6 +310,10 @@ function Invoke-Request($ctx) {
       $data = Read-JsonFile (Join-Path $script:DataDirFull 'settings.json') $null
       if (Test-Dict $data) { Send-JsonText $ctx (ConvertTo-JsonText $data) } else { Send-JsonText $ctx 'null' }
       return
+    }
+    if ($name -eq 'sounds' -and $rest.Count -eq 0) {
+      $files = [string[]](Get-SoundFiles)
+      Send-JsonText $ctx (ConvertTo-JsonText @{ files = $files }); return
     }
     Send-Error $ctx 400 'bad request'; return
   }

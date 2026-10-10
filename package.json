@@ -2,7 +2,7 @@
   "name": "kitano-decibel",
   "private": true,
   "type": "module",
-  "description": "声の大きさ競争（きたのにほんいち）。ビルド不要。テストのみ node --test を使う。",
+  "description": "ロケット かんせいしつ（きたのにほんいち・声の大きさゲーム）。ビルド不要。テストのみ node --test を使う。",
   "scripts": {
     "test": "node --test"
   }

@@ -23,6 +23,7 @@ API（server.ps1 と完全に同じ）
   GET  /api/records/<YYYY-MM-DD>  → その日の全記録（無ければ []）
   POST /api/records/<YYYY-MM-DD>  → 送られた全記録をサーバー側とマージして保存し、マージ結果を返す
   GET  /api/settings              → 設定（無ければ null）
+  GET  /api/sounds                → sound フォルダの音楽ファイル名 {"files":[...]}（BGM 用）
   POST /api/settings              → 設定を保存
 
 テスト用オプション: --port N（固定）/ --data-dir PATH / --no-browser
@@ -31,6 +32,7 @@ API（server.ps1 と完全に同じ）
 import argparse
 import datetime as _dt
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -45,7 +47,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PORT_CANDIDATES = list(range(8000, 8011))
 HISTORY_KEEP = 20
-MAX_BODY = 5 * 1024 * 1024  # 5MB
+MAX_BODY = 20 * 1024 * 1024  # 20MB
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _write_lock = threading.Lock()
@@ -173,6 +175,25 @@ def save_records(data_dir, date, incoming):
 
 
 # ---------------------------------------------------------------------------
+# BGM（sound フォルダ）
+# ---------------------------------------------------------------------------
+
+SOUND_EXTS = (".mp3", ".ogg", ".wav", ".m4a")
+for _ext, _type in ((".woff2", "font/woff2"), (".mp3", "audio/mpeg"), (".ogg", "audio/ogg"), (".wav", "audio/wav"), (".m4a", "audio/mp4")):
+    mimetypes.add_type(_type, _ext)
+
+
+def list_sounds():
+    """sound フォルダの音楽ファイル名（名前順）。フォルダが無ければ空。"""
+    d = os.path.join(ROOT, "sound")
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return sorted(n for n in names if n.lower().endswith(SOUND_EXTS) and not n.startswith(".") and os.path.isfile(os.path.join(d, n)))
+
+
+# ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
 
@@ -238,6 +259,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json(data if isinstance(data, list) else [])
             if name == "settings" and not rest:
                 return self._send_json(read_json(os.path.join(self.data_dir, "settings.json"), None))
+            if name == "sounds" and not rest:
+                return self._send_json({"files": list_sounds()})
             return self._error(HTTPStatus.BAD_REQUEST, "bad request")
         except Exception as e:  # noqa: BLE001
             return self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))

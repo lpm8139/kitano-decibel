@@ -62,7 +62,7 @@ def req(base, path, body=None, method=None, raw=None):
     r = urllib.request.Request(base + path, data=data, method=method or ("POST" if data is not None else "GET"),
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=10) as res:
+        with urllib.request.urlopen(r, timeout=60) as res:
             return res.status, json.loads(res.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, None
@@ -103,7 +103,7 @@ class ApiTest(unittest.TestCase):
     def test_static_index(self):
         with urllib.request.urlopen(self.base + "/", timeout=5) as r:
             self.assertIn("text/html", r.headers["Content-Type"])
-            self.assertIn("声の大きさ競争", r.read().decode("utf-8"))
+            self.assertIn("ロケット かんせいしつ", r.read().decode("utf-8"))
 
     def test_static_blocks_traversal_and_data(self):
         # data/ の中身は静的配信しない（API 経由のみ）
@@ -182,6 +182,43 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(req(self.base, "/api/settings", body)[0], 200)
         self.assertEqual(req(self.base, "/api/settings")[1], body)
         self.assertEqual(req(self.base, "/api/settings", [1, 2])[0], 400)
+
+    def test_sounds_list_and_audio_served(self):
+        """BGM 用: sound フォルダの音楽ファイル名が名前順で返り、そのファイルが音声として配信される"""
+        sound_dir = os.path.join(ROOT, "sound")
+        exts = (".mp3", ".ogg", ".wav", ".m4a")
+        made = None
+        os.makedirs(sound_dir, exist_ok=True)
+        if not any(n.lower().endswith(exts) for n in os.listdir(sound_dir)):
+            made = os.path.join(sound_dir, "zz-api-test.wav")  # 音楽が無い環境ではテスト用の小さな音を一時的に置く
+            with open(made, "wb") as f:
+                f.write(b"RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\xbb\x00\x00\x00w\x01\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+        try:
+            st, data = req(self.base, "/api/sounds")
+            self.assertEqual(st, 200)
+            files = data["files"]
+            expected = sorted(n for n in os.listdir(sound_dir)
+                              if n.lower().endswith(exts) and not n.startswith(".") and os.path.isfile(os.path.join(sound_dir, n)))
+            self.assertEqual(files, expected)
+            self.assertTrue(files)
+            from urllib.parse import quote
+            with urllib.request.urlopen(self.base + "/sound/" + quote(files[0]), timeout=10) as r:
+                self.assertEqual(r.status, 200)
+                self.assertTrue(r.headers["Content-Type"].startswith("audio/"), r.headers["Content-Type"])
+        finally:
+            if made:
+                os.remove(made)
+
+    def test_large_day_is_accepted(self):
+        """1日分が 5MB を超えても保存できる（1日 1000 人超を想定）"""
+        d = "2026-10-07"
+        big = [rec("big%04d" % i, i, series=[[t * 100, 80.5] for t in range(150)], alt=[[t * 100, t * 10] for t in range(160)])
+               for i in range(1700)]
+        body = json.dumps(big).encode("utf-8")
+        self.assertGreater(len(body), 5 * 1024 * 1024)
+        st, merged = req(self.base, "/api/records/" + d, raw=body)
+        self.assertEqual(st, 200)
+        self.assertEqual(len(merged), 1700)
 
     def test_persists_across_restart(self):
         d = "2026-10-06"
