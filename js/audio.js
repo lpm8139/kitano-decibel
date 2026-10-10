@@ -1,8 +1,12 @@
 // audio.js
-// マイク入力（getUserMedia + AnalyserNode）から、約20Hzで dBFS を通知する。
+// マイク入力（getUserMedia）から、約20Hzで dBFS を通知する。
 // 加工系（エコーキャンセル・ノイズ抑制・自動ゲイン）はすべて OFF にして生の音量を測る。
+//
+// 集計は AudioWorklet（js/meter-worklet.js、音声スレッド）で行う。setInterval だと
+// タブが裏に回る・ウィンドウが隠れると 1 秒 1 回に間引かれ、計測が粗くなるため。
+// AudioWorklet が使えないブラウザだけ、従来の AnalyserNode + setInterval にフォールバックする。
 
-import { samplesToDbfs, peakOf, peakToDbfs } from './scoring.js';
+import { samplesToDbfs, peakOf, peakToDbfs, rmsToDbfs } from './scoring.js';
 
 /** 通知間隔（ms）。20Hz。 */
 export const SAMPLE_INTERVAL_MS = 50;
@@ -53,6 +57,9 @@ export class MicMeter {
     this.analyser = null;
     this.buffer = null;
     this.timer = null;
+    this.worklet = null;
+    this.mute = null;
+    this.mode = null; // 'worklet' | 'interval'
     this.status = 'stopped';
   }
 
@@ -106,16 +113,25 @@ export class MicMeter {
     });
 
     const Ctx = window.AudioContext || window.webkitAudioContext;
-    this.ctx = new Ctx({ latencyHint: 'interactive' });
-    const source = this.ctx.createMediaStreamSource(stream);
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 2048; // 48kHz で約43ms。20Hz(50ms)間隔にほぼ重ならず隙間も小さい
-    this.analyser.smoothingTimeConstant = 0;
-    source.connect(this.analyser); // 出力には繋がない（ハウリング防止）
-    this.buffer = new Float32Array(this.analyser.fftSize);
+    const ctx = new Ctx({ latencyHint: 'interactive' });
+    this.ctx = ctx;
+    const source = ctx.createMediaStreamSource(stream);
 
-    this.ctx.addEventListener('statechange', () => this._reportContextState());
-    this.timer = setInterval(() => this._tick(), SAMPLE_INTERVAL_MS);
+    if (await this._startWorklet(ctx, source)) {
+      this.mode = 'worklet';
+    } else {
+      if (this.ctx !== ctx) return false; // 準備中に stop/start された
+      // フォールバック: AnalyserNode を setInterval で読む（裏タブでは間引かれる）
+      this.analyser = ctx.createAnalyser();
+      this.analyser.fftSize = 2048; // 48kHz で約43ms。20Hz(50ms)間隔にほぼ重ならず隙間も小さい
+      this.analyser.smoothingTimeConstant = 0;
+      source.connect(this.analyser); // 出力には繋がない（ハウリング防止）
+      this.buffer = new Float32Array(this.analyser.fftSize);
+      this.timer = setInterval(() => this._tick(), SAMPLE_INTERVAL_MS);
+      this.mode = 'interval';
+    }
+
+    ctx.addEventListener('statechange', () => this._reportContextState());
 
     this._setStatus(this.ctx.state === 'running' ? 'running' : 'suspended', {
       label: track.label,
@@ -139,6 +155,38 @@ export class MicMeter {
     }
   }
 
+  /** AudioWorklet で集計を始める。使えなければ false。 */
+  async _startWorklet(ctx, source) {
+    if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return false;
+    try {
+      await ctx.audioWorklet.addModule(new URL('./meter-worklet.js', import.meta.url));
+      if (this.ctx !== ctx) return false;
+      const node = new AudioWorkletNode(ctx, 'meter-processor', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: { intervalMs: SAMPLE_INTERVAL_MS },
+      });
+      node.port.onmessage = (e) => this._report(e.data.rms, e.data.peak);
+      // 確実に処理させるため destination まで繋ぐが、音量0なのでスピーカーからは何も出ない（ハウリング防止）
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+      source.connect(node);
+      node.connect(mute);
+      mute.connect(ctx.destination);
+      this.worklet = node;
+      this.mute = mute;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _report(rms, peak) {
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    this.onSample({ dbfs: rmsToDbfs(rms), peakDbfs: peakToDbfs(peak), now: performance.now() });
+  }
+
   _tick() {
     if (!this.analyser || this.ctx.state !== 'running') return;
     this.analyser.getFloatTimeDomainData(this.buffer);
@@ -152,6 +200,18 @@ export class MicMeter {
   _teardown() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.worklet) {
+      this.worklet.port.onmessage = null;
+      try {
+        this.worklet.disconnect();
+        this.mute?.disconnect();
+      } catch {
+        /* 既に切断済み */
+      }
+    }
+    this.worklet = null;
+    this.mute = null;
+    this.mode = null;
     if (this.stream) this.stream.getTracks().forEach((t) => t.stop());
     this.stream = null;
     if (this.ctx) this.ctx.close().catch(() => {});
