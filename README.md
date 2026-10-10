@@ -173,20 +173,17 @@ data/             記録の保存先（起動時に自動作成。Git には入�
 
 ## テスト
 
-Node.js 20 以上（動作確認は 22）。ブラウザ不要。
+| 種類 | 内容 | 実行 |
+|---|---|---|
+| JS 単体 | スコア計算・ランキング・CSV・同期（マージ/再送） | `node --test` |
+| 保存サーバー API | 保存・マージ・破棄・世代コピー・ログ・不正リクエスト | `python -m unittest discover -s tests -p "test_*.py"` |
+| 起動時の環境チェック | ポート使用中→次へ、保存先に書けない→LOCALAPPDATA へ | （上と同じコマンドに含まれる） |
+| シナリオ通し（16本） | 仮想マイクに音量既知の音を流して、画面操作から保存ファイルまで確認 | `python tests/e2e_scenarios.py`（Playwright が必要） |
+| Windows 実機 | 上の API・環境チェックを Python 版と **PowerShell 5.1 版**の両方で、JS テストも | `tests\run_windows_tests.bat` をダブルクリック → `tests\windows-test-result.txt` |
 
-```
-node --test
-```
+サーバーのテストは `KITANO_SERVER=powershell`（Windows では `set "KITANO_SERVER=powershell"`）で PowerShell 版に切り替わる。
 
-`scoring.js` `storage.js` `sync.js` が対象。保存サーバーは同じテストを両方の実装に当てる:
-
-```
-python -m unittest discover -s tests -p "test_*.py"                          # server.py
-set "KITANO_SERVER=powershell" && python -m unittest discover -s tests -p "test_*.py"   # server.ps1
-```
-
-マイク・描画は実機での確認が必要（下記チェックリスト）。
+シナリオ通しの中身: 計測精度（70/80/90 dB が ±0.7 以内）、平均と Leq、計測秒数 3/10 秒、しきい値で自動スタート、スタンバイのタイムアウト、計測中の中断、ゴースト・新記録・順位・リード/ビハインド表示、クリップ検出、破棄、リセット、名前とCSV、2画面同時、保存ファイル破損からの復元、計測中のサーバー停止、500件/日の速さ、日付またぎ。
 
 ### 本番前の実機チェックリスト
 

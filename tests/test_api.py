@@ -116,7 +116,7 @@ class ApiTest(unittest.TestCase):
                     self.assertNotIn("root:", body)
                     self.assertNotIn("secret", body)
             except urllib.error.HTTPError as e:
-                self.assertIn(e.code, (400, 404))
+                self.assertIn(e.code, (400, 403, 404))  # Windows の http.sys は 403 で拒否する
 
     def test_records_roundtrip_and_files(self):
         d = "2026-10-01"

@@ -94,12 +94,26 @@ function Merge-Records($a, $b) {
     $sc = Get-Stamp $cur
     if (($sr -gt $sc) -or (($sr -eq $sc) -and (Test-Deleted $r) -and -not (Test-Deleted $cur))) { $byId[$id] = $r }
   }
-  $list = New-Object System.Collections.ArrayList
-  foreach ($v in $byId.Values) { [void]$list.Add($v) }
-  $sorted = $list | Sort-Object -Property @{ Expression = { $t = Get-Field $_ 'ts'; if (Test-Number $t) { [double]$t } else { [double]0 } } }, @{ Expression = { [string](Get-Field $_ 'id') } }
-  $arr = New-Object 'object[]' 0
-  if ($null -ne $sorted) { $arr = [object[]]@($sorted) }
-  return , $arr
+  # 並べ替えは .NET の List.Sort で行う。Sort-Object（パイプライン）を通すと要素が PSObject で包まれ、
+  # Windows PowerShell 5.1 の JavaScriptSerializer が循環参照エラーで保存できなくなるため（Windows 実機で確認）。
+  $list = New-Object 'System.Collections.Generic.List[object]'
+  foreach ($v in $byId.Values) { $list.Add($v.PSObject.BaseObject) }
+  $cmp = [System.Comparison[object]] {
+    param($x, $y)
+    $tx = Get-Stamp-Ts $x
+    $ty = Get-Stamp-Ts $y
+    if ($tx -lt $ty) { return -1 }
+    if ($tx -gt $ty) { return 1 }
+    return [string]::CompareOrdinal([string](Get-Field $x 'id'), [string](Get-Field $y 'id'))
+  }
+  $list.Sort($cmp)
+  return , $list.ToArray()
+}
+
+function Get-Stamp-Ts($r) {
+  $t = Get-Field $r 'ts'
+  if (Test-Number $t) { return [double]$t }
+  return [double]0
 }
 
 # ---------------------------------------------------------------------------
@@ -217,15 +231,20 @@ function Send-JsonText($ctx, [string]$text, [int]$status = 200) {
 }
 
 function Send-Error($ctx, [int]$status, [string]$message) {
-  $h = @{ ok = $false; error = $message }
+  $h = @{ ok = $false; error = [string]$message }
   Send-JsonText $ctx (ConvertTo-JsonText $h) $status
 }
 
-function Read-Body($ctx) {
+# 本文は先に全部読んでおく（読まずに応答すると、Windows では接続がリセットされることがある）
+function Read-BodyText($ctx) {
   $req = $ctx.Request
-  if ($req.ContentLength64 -gt $MaxBody) { throw [System.OverflowException]::new('body too large') }
+  if ($req.ContentLength64 -gt $MaxBody) { return $null }
   $reader = New-Object System.IO.StreamReader($req.InputStream, $Utf8)
-  try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+  try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function ConvertFrom-Body([string]$text) {
+  if ($null -eq $text) { throw [System.OverflowException]::new('body too large') }
   if (-not $text) { throw [System.FormatException]::new('empty body') }
   if ($Utf8.GetByteCount($text) -gt $MaxBody) { throw [System.OverflowException]::new('body too large') }
   try { return , (ConvertFrom-JsonText $text) } catch { throw [System.FormatException]::new('invalid json') }
@@ -261,7 +280,9 @@ function Invoke-Request($ctx) {
 
   if ($method -eq 'GET') {
     if ($name -eq 'health' -and $rest.Count -eq 0) {
-      $h = @{ ok = $true; server = 'powershell'; dataDir = $script:DataDirFull; port = $script:PortUsed }
+      # 値は必ず素の string/int にする。Join-Path などの出力は PSObject で包まれていて、
+      # Windows PowerShell 5.1 の JavaScriptSerializer が循環参照エラーになる（Windows 実機で確認）
+      $h = @{ ok = $true; server = 'powershell'; dataDir = [string]$script:DataDirFull; port = [int]$script:PortUsed }
       Send-JsonText $ctx (ConvertTo-JsonText $h); return
     }
     if ($name -eq 'records' -and $rest.Count -eq 1 -and $rest[0] -match $DateRe) {
@@ -278,16 +299,17 @@ function Invoke-Request($ctx) {
   }
 
   if ($method -eq 'POST') {
+    $bodyText = Read-BodyText $ctx
     try {
       if ($name -eq 'records' -and $rest.Count -eq 1 -and $rest[0] -match $DateRe) {
-        $body = Read-Body $ctx
+        $body = ConvertFrom-Body $bodyText
         $ok = Test-List $body
         if ($ok) { foreach ($r in $body) { if (-not (Test-Record $r)) { $ok = $false; break } } }
         if (-not $ok) { Send-Error $ctx 400 'records must be an array of objects with string id'; return }
         Send-JsonText $ctx (Save-Records $rest[0] $body); return
       }
       if ($name -eq 'settings' -and $rest.Count -eq 0) {
-        $body = Read-Body $ctx
+        $body = ConvertFrom-Body $bodyText
         if (-not (Test-Dict $body)) { Send-Error $ctx 400 'settings must be an object'; return }
         Write-Atomic (Join-Path $script:DataDirFull 'settings.json') (ConvertTo-JsonText $body)
         Send-JsonText $ctx '{"ok":true}'; return
@@ -319,14 +341,24 @@ function Test-Writable([string]$dir) {
 }
 
 function Test-PortFree([int]$p) {
+  # IPv4 と IPv6 の両方で空いているか（片方だけ別アプリが使っていると、ブラウザがそちらに繋がることがある）
   try {
     $t = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
     $t.Start()
     $t.Stop()
-    return $true
   } catch {
     return $false
   }
+  if ([System.Net.Sockets.Socket]::OSSupportsIPv6) {
+    try {
+      $t6 = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::IPv6Loopback, $p)
+      $t6.Start()
+      $t6.Stop()
+    } catch [System.Net.Sockets.SocketException] {
+      if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::AddressAlreadyInUse) { return $false }
+    }
+  }
+  return $true
 }
 
 function Find-Browser {
@@ -369,7 +401,7 @@ if ($DataDir) {
 } else {
   $primary = Join-Path $RootFull 'data'
   if (Test-Writable $primary) {
-    $script:DataDirFull = $primary
+    $script:DataDirFull = [string]$primary
   } else {
     [void]$lines.Add("[注意] $primary に書き込めません（読み取り専用の場所/USBの書き込み禁止など）")
     $base = $env:LOCALAPPDATA
@@ -377,7 +409,7 @@ if ($DataDir) {
     $fallback = Join-Path (Join-Path $base 'kitano-decibel') 'data'
     if (-not (Test-Writable $fallback)) { Write-Host "[NG] 保存先フォルダに書き込めません: $primary / $fallback"; exit 1 }
     [void]$lines.Add("[注意] 代わりに $fallback に保存します")
-    $script:DataDirFull = $fallback
+    $script:DataDirFull = [string]$fallback
   }
 }
 [void]$lines.Add("[OK] 保存先: $($script:DataDirFull)")

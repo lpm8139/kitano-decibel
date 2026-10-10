@@ -525,7 +525,11 @@ function frame(now) {
 const sync = new SyncClient({ onStatus: onSyncStatus, onRecordsMerged });
 
 function onSyncStatus({ online, pending, dataDir }) {
-  if (online) {
+  if (online && !initialSynced) {
+    // つながった直後、保存ファイルの設定・記録を読み込み終わるまでは「保存済み」と出さない
+    ui.setServerBanner(null);
+    ui.setSync('保存ファイルを読み込み中…', 'pending');
+  } else if (online) {
     ui.setServerBanner(null);
     ui.setSync(pending ? 'ファイルに保存中…' : 'ファイルに保存済み ✓', pending ? 'pending' : 'ok');
   } else {
@@ -580,6 +584,7 @@ async function initialSync() {
   }
   await pullDay(dateKey);
   initialSynced = true;
+  sync.emit(); // 「読み込み中」→「保存済み」に表示を更新
   if (records.length) ui.toast(`保存ファイルから本日の記録 ${records.length} 件を読み込みました`, 3000);
 }
 

@@ -201,13 +201,21 @@ class Handler(SimpleHTTPRequestHandler):
     def _error(self, status, message):
         self._send_json({"ok": False, "error": message}, status)
 
-    def _read_body(self):
+    def _read_raw(self):
+        """本文を先に全部読む（読まずに応答すると、Windows では接続がリセットされることがある）。"""
         length = int(self.headers.get("Content-Length") or 0)
-        if length <= 0:
-            raise ValueError("empty body")
         if length > MAX_BODY:
+            self.close_connection = True
+            return None
+        return self.rfile.read(length) if length > 0 else b""
+
+    @staticmethod
+    def _parse(raw):
+        if raw is None:
             raise OverflowError("body too large")
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        if not raw:
+            raise ValueError("empty body")
+        return json.loads(raw.decode("utf-8"))
 
     def _route(self):
         path = self.path.split("?", 1)[0]
@@ -235,17 +243,18 @@ class Handler(SimpleHTTPRequestHandler):
             return self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(e))
 
     def do_POST(self):
+        raw = self._read_raw()
         name, rest = self._route()
         if name is None:
             return self._error(HTTPStatus.NOT_FOUND, "not found")
         try:
             if name == "records" and len(rest) == 1 and DATE_RE.match(rest[0]):
-                body = self._read_body()
+                body = self._parse(raw)
                 if not isinstance(body, list) or not all(isinstance(r, dict) and isinstance(r.get("id"), str) for r in body):
                     return self._error(HTTPStatus.BAD_REQUEST, "records must be an array of objects with string id")
                 return self._send_json(save_records(self.data_dir, rest[0], body))
             if name == "settings" and not rest:
-                body = self._read_body()
+                body = self._parse(raw)
                 if not isinstance(body, dict):
                     return self._error(HTTPStatus.BAD_REQUEST, "settings must be an object")
                 with _write_lock:
@@ -298,13 +307,55 @@ def choose_data_dir(explicit=None):
     raise SystemExit("[NG] 保存先フォルダに書き込めません: %s / %s" % (primary, fallback))
 
 
+class LocalHTTPServer(ThreadingHTTPServer):
+    """ポートを確実に専有するサーバー。
+    Windows の SO_REUSEADDR は「他のプログラムが使用中のポートにも割り込める」意味になるため使わず、
+    代わりに SO_EXCLUSIVEADDRUSE を付ける（これで使用中なら確実にエラー → 次のポートへ）。"""
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+class ThreadingHTTPServerV6(LocalHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _ipv6_available():
+    if not socket.has_ipv6:
+        return False
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        s.bind(("::1", 0))
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
 def bind_server(ports):
+    """127.0.0.1 と ::1 の両方で待ち受ける。
+    ブラウザや Windows は「localhost」をまず IPv6(::1) で試すため、IPv4 だけだと
+    接続のたびに約2秒待たされる（Windows 実機で確認）。どちらも外部には公開しない。"""
+    v6 = _ipv6_available()
     last = None
     for p in ports:
         try:
-            return ThreadingHTTPServer(("127.0.0.1", p), Handler), p
+            s4 = LocalHTTPServer(("127.0.0.1", p), Handler)
         except OSError as e:
             last = e
+            continue
+        s6 = None
+        if v6:
+            try:
+                s6 = ThreadingHTTPServerV6(("::1", p), Handler)
+            except OSError as e:
+                s4.server_close()  # ::1 側を別アプリが使っている → ブラウザがそちらに繋がるので避ける
+                last = e
+                continue
+        return [s for s in (s4, s6) if s], p
     raise SystemExit("[NG] ポート %d〜%d がすべて使用中です（%s）。他のサーバーを閉じてから再実行してください。" % (ports[0], ports[-1], last))
 
 
@@ -348,7 +399,7 @@ def main(argv=None):
     lines += notes
     lines.append("[OK] 保存先: %s" % data_dir)
 
-    server, port = bind_server([args.port] if args.port else PORT_CANDIDATES)
+    servers, port = bind_server([args.port] if args.port else PORT_CANDIDATES)
     if port != PORT_CANDIDATES[0] and not args.port:
         lines.append("[注意] ポート 8000 が使用中のため %d を使います（記録はファイルから復元されるので問題ありません）" % port)
     lines.append("[OK] アドレス: http://localhost:%d/" % port)
@@ -374,12 +425,15 @@ def main(argv=None):
 
     if not args.no_browser:
         threading.Timer(0.8, open_browser, args=("http://localhost:%d/" % port, exe)).start()
+    for extra in servers[1:]:
+        threading.Thread(target=extra.serve_forever, daemon=True).start()
     try:
-        server.serve_forever()
+        servers[0].serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        server.server_close()
+        for s in servers:
+            s.server_close()
 
 
 if __name__ == "__main__":
