@@ -89,7 +89,7 @@ test('renameRecord / removeRecord / normalizeName', () => {
 test('normalizeSettings: 既定値・範囲クランプ・不正値・知らない項目は捨てる', () => {
   assert.deepEqual(normalizeSettings(null), { ...DEFAULT_SETTINGS });
   assert.deepEqual(normalizeSettings({}), { ...DEFAULT_SETTINGS });
-  const s = normalizeSettings({ stage1Sec: 99, threshold: -5, floor: '58', offset: 'abc', deviceId: 3, duration: 5, scoreMethod: 'leq' });
+  const s = normalizeSettings({ stage1Sec: 99, threshold: -5, floor: '58', offset: 'abc', deviceId: 3, kmRate: 5, duration: 5, scoreMethod: 'leq' });
   assert.equal(s.stage1Sec, 10);
   assert.equal(s.threshold, 0);
   assert.equal(s.floor, 58);
@@ -115,6 +115,16 @@ test('normalizeSettings: オン/オフ・背景・暗証番号・目標の高さ
   const g = normalizeSettings({ goal1Km: 300, goal2Km: 200 });
   assert.ok(g.goal2Km > g.goal1Km, `つき(${g.goal2Km}) は うちゅう(${g.goal1Km}) より上`);
   assert.equal(normalizeSettings({ goal2Km: 5000 }).goal2Km, 790); // かせいより手前
+});
+
+test('normalizeSettings: 旧版の設定ファイルは floor を既定に戻し、校正オフセットなどは引き継ぐ', () => {
+  const old = { deviceId: 'mic-1', duration: 5, threshold: 70, floor: 40, offset: 98.5, scoreMethod: 'mean' };
+  const s = normalizeSettings(old);
+  assert.equal(s.floor, DEFAULT_SETTINGS.floor);
+  assert.equal(s.offset, 98.5);
+  assert.equal(s.threshold, 70);
+  assert.equal(s.deviceId, 'mic-1');
+  assert.equal(normalizeSettings({ ...s, floor: 40 }).floor, 40); // ロケット版の設定なら floor はそのまま
 });
 
 // ---- CSV ----

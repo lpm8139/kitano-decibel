@@ -155,8 +155,10 @@ export function normalizeSettings(raw) {
   const r = raw && typeof raw === 'object' ? raw : {};
   const d = DEFAULT_SETTINGS;
   const out = { deviceId: typeof r.deviceId === 'string' ? r.deviceId : d.deviceId };
+  // 旧版（平均dBで競う版）の設定ファイルは floor の意味が違う（旧既定 40）。ロケット版の既定に戻す
+  const legacy = !('kmRate' in r) && ('duration' in r || 'scoreMethod' in r);
   for (const [k, lim] of Object.entries(SETTINGS_LIMITS)) {
-    out[k] = clampNumber(r[k], d[k], lim.min, lim.max, Boolean(lim.integer));
+    out[k] = legacy && k === 'floor' ? d.floor : clampNumber(r[k], d[k], lim.min, lim.max, Boolean(lim.integer));
   }
   if (out.goal2Km <= out.goal1Km) out.goal2Km = Math.min(SETTINGS_LIMITS.goal2Km.max, out.goal1Km + 10);
   for (const k of BOOL_KEYS) out[k] = toBool(r[k], d[k]);
