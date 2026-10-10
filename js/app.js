@@ -62,7 +62,11 @@ function syncDate() {
     dateKey = key;
     setAll(store.loadRecords(dateKey));
     refreshBoard();
-    if (sync.online) pullDay(dateKey).catch(() => {});
+    if (sync.online) {
+      pullDay(dateKey)
+        .then(() => store.pruneOtherDays(dateKey))
+        .catch(() => {});
+    }
   }
 }
 
@@ -584,6 +588,7 @@ async function initialSync() {
   }
   await pullDay(dateKey);
   initialSynced = true;
+  store.pruneOtherDays(dateKey); // ファイル側に保存済みなので、ブラウザの控えは当日分だけ残す
   sync.emit(); // 「読み込み中」→「保存済み」に表示を更新
   if (records.length) ui.toast(`保存ファイルから本日の記録 ${records.length} 件を読み込みました`, 3000);
 }

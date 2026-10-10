@@ -174,3 +174,25 @@ test('saveSettings / loadSettings: 往復と壊れたデータ', () => {
   assert.deepEqual(loadSettings(st), { ...DEFAULT_SETTINGS });
   assert.deepEqual(loadSettings(null), { ...DEFAULT_SETTINGS });
 });
+
+test('pruneOtherDays: 当日以外の記録だけ消え、設定は残る', async () => {
+  const { pruneOtherDays, saveRecords, loadRecords, saveSettings, loadSettings, DEFAULT_SETTINGS } = await import('../js/storage.js');
+  const mem = new Map();
+  const st = {
+    get length() { return mem.size; },
+    key: (i) => [...mem.keys()][i] ?? null,
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+  };
+  const r = [{ id: 'a', score: 80, ts: 1, series: [] }];
+  saveRecords('2026-10-09', r, st);
+  saveRecords('2026-10-10', r, st);
+  saveRecords('2026-10-11', r, st);
+  saveSettings({ ...DEFAULT_SETTINGS, offset: 98 }, st);
+  const removed = pruneOtherDays('2026-10-10', st).sort();
+  assert.deepEqual(removed, ['2026-10-09', '2026-10-11']);
+  assert.equal(loadRecords('2026-10-10', st).length, 1);
+  assert.equal(loadRecords('2026-10-09', st).length, 0);
+  assert.equal(loadSettings(st).offset, 98);
+});

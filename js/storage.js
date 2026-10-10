@@ -238,6 +238,30 @@ export function saveRecords(dateKey, records, storage = defaultStorage()) {
   }
 }
 
+/**
+ * 指定日以外の記録をブラウザから消す（ブラウザの保存領域は 1 サイト約 5MB まで）。
+ * 本体は PC のファイル（data/）にあるので、ブラウザ側は当日分の控えだけで十分。
+ * @returns 消した日付キーの配列
+ */
+export function pruneOtherDays(keepDateKey, storage = defaultStorage()) {
+  const removed = [];
+  try {
+    if (!storage) return removed;
+    const prefix = `${STORAGE_PREFIX}:records:`;
+    const keys = [];
+    for (let i = 0; i < storage.length; i++) keys.push(storage.key(i));
+    for (const k of keys) {
+      if (k && k.startsWith(prefix) && k !== recordsKey(keepDateKey)) {
+        storage.removeItem(k);
+        removed.push(k.slice(prefix.length));
+      }
+    }
+  } catch {
+    /* 保存領域が使えない環境では何もしない */
+  }
+  return removed;
+}
+
 /** 指定日の記録を全削除。 */
 export function clearRecords(dateKey, storage = defaultStorage()) {
   try {
