@@ -3,3 +3,8 @@ data/
 __pycache__/
 node_modules/
 tests/windows-test-result.txt
+# 音源ファイル（OpenTracks 等の規約で再配布禁止のため Git に入れない）
+sound/*.mp3
+sound/*.wav
+sound/*.ogg
+sound/*.m4a
