@@ -1,0 +1,441 @@
+﻿# server.ps1 — 声の大きさ競争 の保存サーバー（PowerShell 版）
+#
+# Python が入っていない Windows PC 用の予備サーバー。Windows 標準の PowerShell 5.1 だけで動く。
+# server.py と同じ API・同じ保存形式（どちらで起動しても同じ data/ フォルダを使える）。
+#
+#   GET  /api/health / GET・POST /api/records/<YYYY-MM-DD> / GET・POST /api/settings
+#
+# 保存の仕組み（server.py と同じ）
+#   data/<日付>.json              … その日の全記録（tmp に書いてから置き換え＝途中で落ちても壊れない）
+#   data/history/<日付>_<時刻>.json … 上書き前の世代コピー（直近20件）
+#   data/<日付>.log.jsonl         … 初めて届いた記録を1行ずつ追記するだけのログ
+#
+# 起動: start.bat から自動で呼ばれる（直接なら powershell -ExecutionPolicy Bypass -File server.ps1）
+# テスト用: -Port 8123 -DataDir <path> -NoBrowser
+
+param(
+  [int]$Port = 0,
+  [string]$DataDir = '',
+  [switch]$NoBrowser
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$RootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+$Utf8 = New-Object System.Text.UTF8Encoding($false)
+$HistoryKeep = 20
+$MaxBody = 5MB
+$DateRe = '^\d{4}-\d{2}-\d{2}$'
+$script:LoggedIds = @{}
+
+# ---------------------------------------------------------------------------
+# JSON（Windows PowerShell 5.1 は JavaScriptSerializer、PowerShell 7 は ConvertFrom-Json -AsHashtable）
+# ConvertTo-Json(5.1) は入れ子の配列（記録の時系列）を壊すことがあるため使わない。
+# ---------------------------------------------------------------------------
+
+$script:Ser = $null
+try {
+  Add-Type -AssemblyName System.Web.Extensions
+  $script:Ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+  $script:Ser.MaxJsonLength = [int]::MaxValue
+  $script:Ser.RecursionLimit = 1000
+} catch {
+  $script:Ser = $null
+}
+
+function ConvertFrom-JsonText([string]$text) {
+  if ($script:Ser) { return , $script:Ser.DeserializeObject($text) }
+  return , (ConvertFrom-Json -InputObject $text -AsHashtable -Depth 100 -NoEnumerate)
+}
+
+function ConvertTo-JsonText($obj) {
+  if ($script:Ser) { return $script:Ser.Serialize($obj) }
+  return (ConvertTo-Json -InputObject $obj -Depth 100 -Compress)
+}
+
+function Test-Dict($x) { return ($x -is [System.Collections.IDictionary]) }
+function Test-List($x) { return ($null -ne $x) -and ($x -is [System.Collections.IList]) -and -not (Test-Dict $x) }
+
+function Get-Field($r, [string]$k) {
+  if ((Test-Dict $r) -and (@($r.Keys) -contains $k)) { return , $r[$k] }
+  return $null
+}
+
+function Test-Number($v) {
+  return ($v -is [int]) -or ($v -is [long]) -or ($v -is [double]) -or ($v -is [decimal]) -or ($v -is [single])
+}
+
+function Get-Stamp($r) {
+  foreach ($k in @('updatedAt', 'ts')) {
+    $v = Get-Field $r $k
+    if (Test-Number $v) { return [double]$v }
+  }
+  return [double]0
+}
+
+function Test-Deleted($r) { return ((Get-Field $r 'deleted') -eq $true) }
+
+function Test-Record($r) { return (Test-Dict $r) -and ((Get-Field $r 'id') -is [string]) }
+
+# ID ごとに新しい方（updatedAt が大きい方）を残す。同時刻なら破棄済みを優先。ts 昇順。（js/sync.js・server.py と同じ規則）
+function Merge-Records($a, $b) {
+  $byId = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+  $all = New-Object System.Collections.ArrayList
+  if (Test-List $a) { foreach ($x in $a) { [void]$all.Add($x) } }
+  if (Test-List $b) { foreach ($x in $b) { [void]$all.Add($x) } }
+  foreach ($r in $all) {
+    if (-not (Test-Record $r)) { continue }
+    $id = [string](Get-Field $r 'id')
+    if (-not $byId.ContainsKey($id)) { $byId[$id] = $r; continue }
+    $cur = $byId[$id]
+    $sr = Get-Stamp $r
+    $sc = Get-Stamp $cur
+    if (($sr -gt $sc) -or (($sr -eq $sc) -and (Test-Deleted $r) -and -not (Test-Deleted $cur))) { $byId[$id] = $r }
+  }
+  $list = New-Object System.Collections.ArrayList
+  foreach ($v in $byId.Values) { [void]$list.Add($v) }
+  $sorted = $list | Sort-Object -Property @{ Expression = { $t = Get-Field $_ 'ts'; if (Test-Number $t) { [double]$t } else { [double]0 } } }, @{ Expression = { [string](Get-Field $_ 'id') } }
+  $arr = New-Object 'object[]' 0
+  if ($null -ne $sorted) { $arr = [object[]]@($sorted) }
+  return , $arr
+}
+
+# ---------------------------------------------------------------------------
+# ファイル
+# ---------------------------------------------------------------------------
+
+function Write-Atomic([string]$path, [string]$text) {
+  $tmp = "$path.tmp"
+  $bytes = $Utf8.GetBytes($text)
+  $fs = [System.IO.File]::Open($tmp, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+  try {
+    $fs.Write($bytes, 0, $bytes.Length)
+    $fs.Flush($true)
+  } finally {
+    $fs.Dispose()
+  }
+  if ([System.IO.File]::Exists($path)) {
+    [System.IO.File]::Replace($tmp, $path, [NullString]::Value)
+  } else {
+    [System.IO.File]::Move($tmp, $path)
+  }
+}
+
+function Read-JsonFile([string]$path, $default) {
+  if (-not [System.IO.File]::Exists($path)) { return , $default }
+  try {
+    return , (ConvertFrom-JsonText ([System.IO.File]::ReadAllText($path, $Utf8)))
+  } catch {
+    try { Copy-Item -LiteralPath $path -Destination ($path + '.broken-' + (Get-Date -Format 'yyyyMMddHHmmss')) } catch { }
+    return , $default
+  }
+}
+
+function Backup-History([string]$date, [string]$path) {
+  if (-not [System.IO.File]::Exists($path)) { return }
+  $hist = Join-Path $script:DataDirFull 'history'
+  [void][System.IO.Directory]::CreateDirectory($hist)
+  $stamp = (Get-Date).ToString('HHmmss_ffffff')
+  Copy-Item -LiteralPath $path -Destination (Join-Path $hist "${date}_$stamp.json")
+  $mine = @(Get-ChildItem -LiteralPath $hist -File | Where-Object { $_.Name -like "${date}_*.json" } | Sort-Object Name)
+  if ($mine.Count -gt $HistoryKeep) {
+    $mine[0..($mine.Count - $HistoryKeep - 1)] | ForEach-Object { try { [System.IO.File]::Delete($_.FullName) } catch { } }
+  }
+}
+
+function Add-Log([string]$date, $records) {
+  $path = Join-Path $script:DataDirFull "$date.log.jsonl"
+  if (-not $script:LoggedIds.ContainsKey($date)) {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    if ([System.IO.File]::Exists($path)) {
+      foreach ($line in [System.IO.File]::ReadAllLines($path, $Utf8)) {
+        if (-not $line.Trim()) { continue }
+        try {
+          $id = Get-Field (ConvertFrom-JsonText $line) 'id'
+          if ($id -is [string]) { [void]$seen.Add($id) }
+        } catch { }
+      }
+    }
+    $script:LoggedIds[$date] = $seen
+  }
+  $seen = $script:LoggedIds[$date]
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($r in $records) {
+    $id = [string](Get-Field $r 'id')
+    if ($seen.Contains($id)) { continue }
+    [void]$sb.Append((ConvertTo-JsonText $r)).Append("`n")
+    [void]$seen.Add($id)
+  }
+  if ($sb.Length -eq 0) { return }
+  $bytes = $Utf8.GetBytes($sb.ToString())
+  $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+  try {
+    $fs.Write($bytes, 0, $bytes.Length)
+    $fs.Flush($true)
+  } finally {
+    $fs.Dispose()
+  }
+}
+
+function Save-Records([string]$date, $incoming) {
+  $path = Join-Path $script:DataDirFull "$date.json"
+  $current = Read-JsonFile $path (New-Object 'object[]' 0)
+  if (-not (Test-List $current)) { $current = New-Object 'object[]' 0 }
+  $merged = Merge-Records $current $incoming
+  $mergedText = ConvertTo-JsonText $merged
+  if (-not [System.IO.File]::Exists($path) -or $mergedText -ne (ConvertTo-JsonText $current)) {
+    Backup-History $date $path
+    Write-Atomic $path $mergedText
+  }
+  Add-Log $date $merged
+  return $mergedText
+}
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
+
+$ContentTypes = @{
+  '.html' = 'text/html; charset=utf-8'; '.js' = 'text/javascript; charset=utf-8'; '.css' = 'text/css; charset=utf-8'
+  '.json' = 'application/json; charset=utf-8'; '.svg' = 'image/svg+xml'; '.png' = 'image/png'; '.ico' = 'image/x-icon'
+  '.md' = 'text/plain; charset=utf-8'; '.txt' = 'text/plain; charset=utf-8'; '.csv' = 'text/csv; charset=utf-8'
+}
+
+function Send-Bytes($ctx, [byte[]]$bytes, [string]$type, [int]$status = 200) {
+  $res = $ctx.Response
+  $res.StatusCode = $status
+  $res.ContentType = $type
+  $res.Headers['Cache-Control'] = 'no-store'
+  $res.ContentLength64 = $bytes.Length
+  $res.OutputStream.Write($bytes, 0, $bytes.Length)
+}
+
+function Send-JsonText($ctx, [string]$text, [int]$status = 200) {
+  Send-Bytes $ctx ($Utf8.GetBytes($text)) 'application/json; charset=utf-8' $status
+}
+
+function Send-Error($ctx, [int]$status, [string]$message) {
+  $h = @{ ok = $false; error = $message }
+  Send-JsonText $ctx (ConvertTo-JsonText $h) $status
+}
+
+function Read-Body($ctx) {
+  $req = $ctx.Request
+  if ($req.ContentLength64 -gt $MaxBody) { throw [System.OverflowException]::new('body too large') }
+  $reader = New-Object System.IO.StreamReader($req.InputStream, $Utf8)
+  try { $text = $reader.ReadToEnd() } finally { $reader.Dispose() }
+  if (-not $text) { throw [System.FormatException]::new('empty body') }
+  if ($Utf8.GetByteCount($text) -gt $MaxBody) { throw [System.OverflowException]::new('body too large') }
+  try { return , (ConvertFrom-JsonText $text) } catch { throw [System.FormatException]::new('invalid json') }
+}
+
+function Send-Static($ctx, [string]$urlPath) {
+  $rel = [System.Uri]::UnescapeDataString($urlPath)
+  if ($rel -eq '/' -or $rel -eq '') { $rel = '/index.html' }
+  if ($rel.StartsWith('/data/') -or $rel -eq '/data') { Send-Error $ctx 404 'not found'; return }
+  $full = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($RootFull, $rel.TrimStart('/').Replace('/', [System.IO.Path]::DirectorySeparatorChar)))
+  $prefix = $RootFull + [System.IO.Path]::DirectorySeparatorChar
+  if (-not $full.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) -or -not [System.IO.File]::Exists($full)) {
+    Send-Error $ctx 404 'not found'
+    return
+  }
+  $ext = [System.IO.Path]::GetExtension($full).ToLowerInvariant()
+  $type = $ContentTypes[$ext]
+  if (-not $type) { $type = 'application/octet-stream' }
+  Send-Bytes $ctx ([System.IO.File]::ReadAllBytes($full)) $type
+}
+
+function Invoke-Request($ctx) {
+  $path = $ctx.Request.Url.AbsolutePath
+  $method = $ctx.Request.HttpMethod
+  if (-not $path.StartsWith('/api/')) {
+    if ($method -eq 'GET' -or $method -eq 'HEAD') { Send-Static $ctx $path } else { Send-Error $ctx 404 'not found' }
+    return
+  }
+  $parts = @($path.Substring(5).Trim('/').Split('/'))
+  $name = $parts[0]
+  $rest = @()
+  if ($parts.Count -gt 1) { $rest = @($parts[1..($parts.Count - 1)]) }
+
+  if ($method -eq 'GET') {
+    if ($name -eq 'health' -and $rest.Count -eq 0) {
+      $h = @{ ok = $true; server = 'powershell'; dataDir = $script:DataDirFull; port = $script:PortUsed }
+      Send-JsonText $ctx (ConvertTo-JsonText $h); return
+    }
+    if ($name -eq 'records' -and $rest.Count -eq 1 -and $rest[0] -match $DateRe) {
+      $data = Read-JsonFile (Join-Path $script:DataDirFull "$($rest[0]).json") $null
+      if (Test-List $data) { Send-JsonText $ctx (ConvertTo-JsonText $data) } else { Send-JsonText $ctx '[]' }
+      return
+    }
+    if ($name -eq 'settings' -and $rest.Count -eq 0) {
+      $data = Read-JsonFile (Join-Path $script:DataDirFull 'settings.json') $null
+      if (Test-Dict $data) { Send-JsonText $ctx (ConvertTo-JsonText $data) } else { Send-JsonText $ctx 'null' }
+      return
+    }
+    Send-Error $ctx 400 'bad request'; return
+  }
+
+  if ($method -eq 'POST') {
+    try {
+      if ($name -eq 'records' -and $rest.Count -eq 1 -and $rest[0] -match $DateRe) {
+        $body = Read-Body $ctx
+        $ok = Test-List $body
+        if ($ok) { foreach ($r in $body) { if (-not (Test-Record $r)) { $ok = $false; break } } }
+        if (-not $ok) { Send-Error $ctx 400 'records must be an array of objects with string id'; return }
+        Send-JsonText $ctx (Save-Records $rest[0] $body); return
+      }
+      if ($name -eq 'settings' -and $rest.Count -eq 0) {
+        $body = Read-Body $ctx
+        if (-not (Test-Dict $body)) { Send-Error $ctx 400 'settings must be an object'; return }
+        Write-Atomic (Join-Path $script:DataDirFull 'settings.json') (ConvertTo-JsonText $body)
+        Send-JsonText $ctx '{"ok":true}'; return
+      }
+      Send-Error $ctx 400 'bad request'; return
+    } catch [System.OverflowException] {
+      Send-Error $ctx 413 'body too large'; return
+    } catch [System.FormatException] {
+      Send-Error $ctx 400 'invalid json'; return
+    }
+  }
+  Send-Error $ctx 404 'not found'
+}
+
+# ---------------------------------------------------------------------------
+# 環境チェック
+# ---------------------------------------------------------------------------
+
+function Test-Writable([string]$dir) {
+  try {
+    [void][System.IO.Directory]::CreateDirectory($dir)
+    $test = Join-Path $dir '.write-test'
+    [System.IO.File]::WriteAllText($test, 'ok')
+    [System.IO.File]::Delete($test)
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Test-PortFree([int]$p) {
+  try {
+    $t = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $p)
+    $t.Start()
+    $t.Stop()
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+function Find-Browser {
+  $cands = @(
+    @{ Label = 'Chrome'; Bases = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA); Rel = 'Google\Chrome\Application\chrome.exe' },
+    @{ Label = 'Edge'; Bases = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:LOCALAPPDATA); Rel = 'Microsoft\Edge\Application\msedge.exe' }
+  )
+  foreach ($c in $cands) {
+    foreach ($b in $c.Bases) {
+      if ($b -and (Test-Path -LiteralPath (Join-Path $b $c.Rel))) { return @{ Exe = (Join-Path $b $c.Rel); Label = $c.Label } }
+    }
+  }
+  return @{ Exe = $null; Label = '既定のブラウザ' }
+}
+
+$lines = New-Object System.Collections.ArrayList
+[void]$lines.Add("===== 環境チェック $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') =====")
+[void]$lines.Add("[OK] サーバー: PowerShell $($PSVersionTable.PSVersion)")
+
+# JSON 処理の自己テスト（保存形式が壊れないことを起動時に確認）
+try {
+  $sample = '[{"id":"b","ts":2,"updatedAt":2,"name":"テスト","score":80.5,"series":[[0,70.1],[50,80.25]]},{"id":"a","ts":1,"updatedAt":1,"series":[[0,1]]}]'
+  $newer = '[{"id":"b","ts":2,"updatedAt":9,"deleted":true,"series":[[0,70.1]]}]'
+  $m = Merge-Records (ConvertFrom-JsonText $sample) (ConvertFrom-JsonText $newer)
+  $back = ConvertFrom-JsonText (ConvertTo-JsonText $m)
+  $ok = ($back.Count -eq 2) -and ((Get-Field $back[0] 'id') -eq 'a') -and (Test-Deleted $back[1]) -and
+        ($back[0]['series'][0].Count -eq 2) -and ([double]($back[1]['series'][0][1]) -eq 70.1)
+  if (-not $ok) { throw 'roundtrip mismatch' }
+  $engine = if ($script:Ser) { 'JavaScriptSerializer' } else { 'ConvertFrom-Json' }
+  [void]$lines.Add("[OK] JSON 処理の自己テスト（$engine）")
+} catch {
+  Write-Host "[NG] JSON 処理の自己テストに失敗しました: $($_.Exception.Message)"
+  Write-Host '     Python 3 をインストールして start.bat を実行し直してください。'
+  exit 1
+}
+
+if ($DataDir) {
+  $script:DataDirFull = [System.IO.Path]::GetFullPath($DataDir)
+  if (-not (Test-Writable $script:DataDirFull)) { Write-Host "[NG] 保存先に書き込めません: $($script:DataDirFull)"; exit 1 }
+} else {
+  $primary = Join-Path $RootFull 'data'
+  if (Test-Writable $primary) {
+    $script:DataDirFull = $primary
+  } else {
+    [void]$lines.Add("[注意] $primary に書き込めません（読み取り専用の場所/USBの書き込み禁止など）")
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { $base = Join-Path $HOME '.local/share' }
+    $fallback = Join-Path (Join-Path $base 'kitano-decibel') 'data'
+    if (-not (Test-Writable $fallback)) { Write-Host "[NG] 保存先フォルダに書き込めません: $primary / $fallback"; exit 1 }
+    [void]$lines.Add("[注意] 代わりに $fallback に保存します")
+    $script:DataDirFull = $fallback
+  }
+}
+[void]$lines.Add("[OK] 保存先: $($script:DataDirFull)")
+
+$candidates = if ($Port -gt 0) { @($Port) } else { 8000..8010 }
+$listener = $null
+foreach ($p in $candidates) {
+  if (-not (Test-PortFree $p)) { continue }
+  $l = New-Object System.Net.HttpListener
+  $l.Prefixes.Add("http://localhost:$p/")
+  try {
+    $l.Start()
+    $listener = $l
+    $script:PortUsed = $p
+    break
+  } catch {
+    try { $l.Close() } catch { }
+  }
+}
+if (-not $listener) {
+  Write-Host "[NG] ポート $($candidates[0])〜$($candidates[-1]) がすべて使用中です。他のサーバーを閉じてから再実行してください。"
+  exit 1
+}
+if ($Port -le 0 -and $script:PortUsed -ne 8000) {
+  [void]$lines.Add("[注意] ポート 8000 が使用中のため $($script:PortUsed) を使います（記録はファイルから復元されるので問題ありません）")
+}
+$url = "http://localhost:$($script:PortUsed)/"
+[void]$lines.Add("[OK] アドレス: $url")
+
+$browser = Find-Browser
+if (-not $NoBrowser) { [void]$lines.Add("[OK] ブラウザ: $($browser.Label)") }
+
+foreach ($ln in $lines) { Write-Host $ln }
+try { [System.IO.File]::AppendAllText((Join-Path $script:DataDirFull 'env-check.log'), (($lines -join "`r`n") + "`r`n"), $Utf8) } catch { }
+Write-Host ''
+Write-Host 'このウィンドウは本番中は閉じないでください（閉じると保存サーバーが止まります）。'
+Write-Host '止まっても、もう一度 start.bat を実行すれば記録はそのまま戻ります。'
+
+if (-not $NoBrowser) {
+  try {
+    if ($browser.Exe) { Start-Process -FilePath $browser.Exe -ArgumentList $url } else { Start-Process $url }
+  } catch {
+    Write-Host "[注意] ブラウザを開けませんでした。手動で $url を開いてください。"
+  }
+}
+
+try {
+  while ($listener.IsListening) {
+    $ctx = $listener.GetContext()
+    try {
+      Invoke-Request $ctx
+    } catch {
+      Write-Host "[エラー] $($_.Exception.Message)"
+      try { Send-Error $ctx 500 $_.Exception.Message } catch { }
+    } finally {
+      try { $ctx.Response.Close() } catch { }
+    }
+  }
+} finally {
+  try { $listener.Stop(); $listener.Close() } catch { }
+}

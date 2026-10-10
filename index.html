@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>声の大きさ競争</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <!-- start.bat を使わずファイルを直接開いた場合はJSが動かないので、この案内が出たままになる -->
+  <div id="server-banner" class="server-banner">このページは start.bat から開いてください（index.html を直接開くと動きません）</div>
+  <div id="app" data-state="idle" data-lead="none" data-ghost="none">
+    <!-- ===== メイン（プロジェクター表示） ===== -->
+    <main class="stage">
+      <header class="topbar">
+        <h1 class="title">声の大きさ競争</h1>
+        <div class="topbar-right">
+          <span id="clip-warning" class="clip" hidden>CLIP! 音が割れています（ゲインを下げる）</span>
+          <span id="sync-status" class="sync-status" data-kind="pending">保存サーバー確認中…</span>
+          <span id="mic-status" class="mic-status" data-kind="pending">マイク準備中…</span>
+        </div>
+      </header>
+
+      <section class="center">
+        <div id="state-label" class="state-label">待機中</div>
+
+        <div id="readout" class="readout">
+          <span id="db-int" class="db-int">--</span><span id="db-frac" class="db-frac"></span><span class="db-unit">dB</span>
+        </div>
+        <div id="timer" class="timer">計測 5 秒</div>
+        <p id="message" class="message">Space キーでスタンバイ</p>
+
+        <!-- 結果表示 -->
+        <div id="result" class="result" hidden>
+          <div id="result-banner" class="result-banner" hidden>NEW RECORD!</div>
+          <div class="result-label">スコア</div>
+          <div class="result-score"><span id="result-score">0.0</span><span class="db-unit">dB</span></div>
+          <div id="result-rank" class="result-rank"></div>
+          <form id="result-form" class="result-form" autocomplete="off">
+            <input id="result-name" type="text" maxlength="20" placeholder="名前（空欄OK）" aria-label="名前">
+            <button type="submit" id="btn-result-ok" class="btn btn-primary">決定 (Enter)</button>
+            <button type="button" id="btn-result-discard" class="btn btn-ghost">この記録を破棄</button>
+          </form>
+          <p class="result-hint">Enter で決定して待機へ / 入力欄の外で Space を押すと次の人のスタンバイへ</p>
+        </div>
+      </section>
+
+      <!-- ===== ゴーストレース ===== -->
+      <section id="race" class="race">
+        <div id="lead-badge" class="lead-badge" aria-live="polite"></div>
+        <div class="lane lane-you">
+          <div class="lane-head">
+            <span id="you-name" class="lane-name">あなた</span>
+            <span class="lane-value"><span id="you-value">0</span> pt</span>
+          </div>
+          <div class="track"><div id="you-fill" class="fill"></div></div>
+        </div>
+        <div class="lane lane-ghost">
+          <div class="lane-head">
+            <span id="ghost-name" class="lane-name">ゴースト</span>
+            <span class="lane-value"><span id="ghost-value">0</span> pt</span>
+          </div>
+          <div class="track"><div id="ghost-fill" class="fill"></div></div>
+        </div>
+      </section>
+
+      <footer class="best-bar">
+        <span class="best-label">本日ベスト</span>
+        <span id="best-score" class="best-score">--</span>
+        <span id="best-name" class="best-name"></span>
+      </footer>
+    </main>
+
+    <!-- ===== 右：本日TOP10 ===== -->
+    <aside class="side">
+      <h2 class="side-title">本日 TOP10</h2>
+      <ol id="top10" class="top10"></ol>
+      <div class="side-actions">
+        <button type="button" id="btn-csv" class="btn btn-ghost">CSV出力</button>
+        <button type="button" id="btn-settings" class="btn btn-ghost">設定 (S)</button>
+        <button type="button" id="btn-reset" class="btn btn-danger">本日の記録をリセット</button>
+      </div>
+      <p class="keys">Space スタンバイ/開始 ・ Esc 中断 ・ F 全画面 ・ S 設定</p>
+    </aside>
+  </div>
+
+  <!-- ===== 設定パネル ===== -->
+  <div id="settings" class="overlay" hidden>
+    <div class="panel" role="dialog" aria-labelledby="settings-title">
+      <h2 id="settings-title">設定</h2>
+
+      <div class="live-box">
+        <div>現在の入力 <strong id="live-db">--</strong> dB <span class="dim">(<span id="live-dbfs">--</span> dBFS)</span></div>
+        <div class="dim">校正時は、ここの dBFS とスマホ騒音計の値を見比べます。</div>
+      </div>
+
+      <label class="field">
+        <span>入力デバイス</span>
+        <select id="set-device"></select>
+      </label>
+      <label class="field">
+        <span>計測秒数（3〜10）</span>
+        <input id="set-duration" type="number" min="3" max="10" step="1">
+      </label>
+      <label class="field">
+        <span>開始しきい値 dB（超えた瞬間に計測開始）</span>
+        <input id="set-threshold" type="number" min="0" max="140" step="1">
+      </label>
+      <label class="field">
+        <span>floor dB（これ以下は競争ポイントに加算しない）</span>
+        <input id="set-floor" type="number" min="0" max="120" step="1">
+      </label>
+      <label class="field">
+        <span>校正オフセット dB（表示dB = dBFS + オフセット）</span>
+        <input id="set-offset" type="number" min="-100" max="200" step="0.5">
+      </label>
+      <label class="field">
+        <span>スコア方式</span>
+        <select id="set-method">
+          <option value="mean">dBサンプルの平均（既定）</option>
+          <option value="leq">エネルギー平均 Leq</option>
+        </select>
+      </label>
+
+      <div class="live-box">
+        <div>記録の保存先（PC のフォルダ）</div>
+        <div class="data-dir"><code id="data-dir">（保存サーバー未接続）</code></div>
+        <div class="dim">記録は1件ごとにここへ自動保存されます。イベント後はこのフォルダごと USB などにコピーしてください。</div>
+      </div>
+
+      <p class="note">※ 記録が残っている状態で校正オフセット・スコア方式を変えると、過去の記録と比較できなくなります。本番中は触らないでください。</p>
+      <div class="panel-actions">
+        <button type="button" id="btn-settings-close" class="btn btn-primary">閉じる (S / Esc)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 確認モーダル（alert/confirm の代わり） ===== -->
+  <div id="modal" class="overlay" hidden>
+    <div class="panel panel-small" role="alertdialog" aria-labelledby="modal-title" aria-describedby="modal-message">
+      <h2 id="modal-title"></h2>
+      <p id="modal-message"></p>
+      <div class="panel-actions">
+        <button type="button" id="modal-cancel" class="btn btn-ghost">キャンセル</button>
+        <button type="button" id="modal-ok" class="btn btn-danger">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="flash" class="flash"></div>
+  <div id="announce" class="announce"></div>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
