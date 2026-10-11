@@ -79,6 +79,33 @@ export function markAllDeleted(records, now = Date.now()) {
   return records.map((r) => (r.deleted ? r : { ...r, deleted: true, updatedAt: now }));
 }
 
+// ---------------------------------------------------------------------------
+// 部門
+// ---------------------------------------------------------------------------
+
+export const DIVISIONS = Object.freeze([
+  { key: 'k', name: 'ようちえん', short: 'ようちえん' },
+  { key: 'low', name: '1〜3ねんせい', short: '1〜3ねん' },
+  { key: 'high', name: '4〜6ねんせい', short: '4〜6ねん' },
+  { key: 'adult', name: 'おとな', short: 'おとな' },
+]);
+
+/** 部門の表示名（無い・不明なら ''）。 */
+export function divisionName(key, short = false) {
+  const d = DIVISIONS.find((x) => x.key === key);
+  return d ? (short ? d.short : d.name) : '';
+}
+
+/** 正しい部門キーか（'' = 部門なし も正しい）。不正なら ''。 */
+export function normalizeDivision(key) {
+  return DIVISIONS.some((x) => x.key === key) ? key : '';
+}
+
+/** その部門の記録だけ（division = null なら全部）。 */
+export function inDivision(records, division) {
+  return division === null || division === undefined ? records : records.filter((r) => (r.division || '') === division);
+}
+
 /** 名前の正規化（前後空白除去・最大20文字）。 */
 export function normalizeName(name) {
   return String(name ?? '').trim().slice(0, 20);
@@ -115,6 +142,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // 表示・運用
   theme: 'light', // 'light'（明るい管制室） | 'dark'（暗い宇宙）
   rehearsal: false, // オン中の記録はランキング・ゴーストに入れない
+  divisions: true, // 部門（ようちえん・1〜3ねん・4〜6ねん・おとな）ごとにランキングとチャンピオンを分ける
+  ghostAvg: true, // 「へいきん」ゴースト（その部門の今日の平均の飛び方）
   adminPin: '0000',
 });
 
@@ -132,7 +161,7 @@ export const SETTINGS_LIMITS = Object.freeze({
   seVolume: { min: 0, max: 1 },
 });
 
-const BOOL_KEYS = ['booster', 'cheerBoost', 'ghost', 'nameInput', 'bgm', 'muteBgmDuringRun', 'se', 'seDuringRun', 'rehearsal'];
+const BOOL_KEYS = ['booster', 'cheerBoost', 'ghost', 'ghostAvg', 'divisions', 'nameInput', 'bgm', 'muteBgmDuringRun', 'se', 'seDuringRun', 'rehearsal'];
 
 function clampNumber(value, fallback, min, max, integer = false) {
   if (value === null || value === undefined) return fallback;
@@ -190,10 +219,19 @@ const PLACE_NAME = Object.fromEntries(LANDMARKS.map((m) => [m.key, m.name]));
  * 行はランキング順（高さの高い順）。
  */
 export function buildCsv(records) {
-  const header = ['順位', '名前', '高さ(km)', 'とどいた場所', '平均dB', 'ブースター', '記録時刻', 'クリップ'];
+  const header = ['順位', '名前', '部門', '部門内順位', '高さ(km)', 'とどいた場所', '平均dB', 'ブースター', '記録時刻', 'クリップ'];
+  const divRank = new Map();
+  const seen = {};
+  for (const r of sortRecords(records)) {
+    const d = r.division || '';
+    seen[d] = (seen[d] ?? 0) + 1;
+    divRank.set(r.id, seen[d]);
+  }
   const rows = sortRecords(records).map((r, i) => [
     i + 1,
     neutralizeFormula(r.name || ''),
+    divisionName(r.division),
+    r.division ? divRank.get(r.id) : '',
     Math.round(Number(r.score)),
     PLACE_NAME[r.reached] ?? '',
     Number.isFinite(r.meanDb) ? Number(r.meanDb).toFixed(1) : '',

@@ -105,8 +105,8 @@ class Env:
         self.data = tempfile.mkdtemp(prefix="data-", dir=self.tmp)
         self.port = free_port()
         self.start_server()
-        if settings:
-            api(self.base, "/api/settings", {**DEFAULT_SETTINGS, **settings})
+        # 部門わけ・へいきんゴーストは、それを試すシナリオ（S21〜）だけでオンにする
+        api(self.base, "/api/settings", {**DEFAULT_SETTINGS, **(settings or {})})
 
     def start_server(self):
         self.server, self.base = start_server(self.data, self.port)
@@ -155,6 +155,7 @@ DEFAULT_SETTINGS = {
     "stage1Sec": 5, "endlessMaxSec": 10, "silenceEndSec": 1, "booster": True, "cheerBoost": True, "ghost": True,
     "nameInput": True, "bgm": True, "bgmVolume": 0.4, "muteBgmDuringRun": True, "se": True, "seVolume": 0.7,
     "seDuringRun": False, "theme": "light", "rehearsal": False, "adminPin": "0000",
+    "divisions": False, "ghostAvg": False,
 }
 RUN_STATES = ("stage1", "booster", "endless")
 
@@ -214,7 +215,7 @@ def fly(p, manual=False):
     while state(p) in RUN_STATES and time.time() - t0 < 40:
         info = p.evaluate("""({s: document.getElementById('stage').dataset.state, side: document.getElementById('stage').dataset.side,
           goal: !document.getElementById('goal-card').hidden, boost: !document.getElementById('booster-pill').hidden,
-          ghost: document.getElementById('stage').dataset.ghost})""")
+          ghost: document.querySelector('.rocket.ghost.champ')?.hidden === false ? 'has' : 'none'})""")
         if not seen["states"] or seen["states"][-1] != info["s"]:
             seen["states"].append(info["s"])
         seen["sides"].add(info["side"])
@@ -453,7 +454,7 @@ def s10_names(env):
     check(len(rs) == 3, f"件数 {len(rs)}")
     check(len(rs[0]["name"]) == 20 and rs[1]["name"] == "" and rs[2]["name"] == "", f"名前: {[r['name'] for r in rs]}")
     csv = download_csv(p)
-    check("'=1+1" in csv and csv.startswith("順位,名前,高さ(km)"), f"CSV: {csv[:200]!r}")
+    check("'=1+1" in csv and csv.startswith("順位,名前,部門,部門内順位,高さ(km)"), f"CSV: {csv[:200]!r}")
     return "20文字切り・Esc で名前なし・Space で次へ・CSV 無害化"
 
 
@@ -711,6 +712,111 @@ def s20_bgm(env):
             os.remove(made)
 
 
+def s21_divisions(env):
+    """部門: 部門ごとのランキング・1位・へいきんゴースト、部門を選ばずに飛んだら結果で選ぶ"""
+    env.fresh({"divisions": True, "ghostAvg": True, "endlessMaxSec": 3})
+    p = env.page("tone-30")
+    for n in ("A", "B", "C"):
+        p.keyboard.press("Digit2")  # 1〜3ねん
+        play(p, n)
+    rs = records(env, p)
+    check([r["division"] for r in rs] == ["low"] * 3, f"部門: {[r.get('division') for r in rs]}")
+    q = env.page("tone-20")
+    q.keyboard.press("Digit2")
+    q.keyboard.press("Space")
+    wait_state(q, RUN_STATES, 10)
+    time.sleep(1.5)
+    g = q.evaluate("""({avg: !document.querySelector('.rocket.ghost.avg').hidden, champ: !document.querySelector('.rocket.ghost.champ').hidden,
+      champLabel: document.querySelector('.rocket.ghost.champ .rocket-label').textContent,
+      avgLabel: document.querySelector('.rocket.ghost.avg .rocket-label').textContent})""")
+    check(g["avg"] and g["champ"] and "1〜3ねん" in g["champLabel"] and "へいきん" in g["avgLabel"], f"ゴースト: {g}")
+    wait_state(q, "result", 30)
+    cells = q.evaluate("[0,1,2].map(i => document.querySelector('#cell-' + i + ' .cell-v').textContent)")
+    check(cells[2] == "1〜3ねん 1 い" and q.is_visible("#newrecord-pill"), f"結果: {cells}")
+    name_and_close(q, "D")
+    # ようちえん: 記録が無いのでゴーストなし・その部門で 1 い
+    q.keyboard.press("Digit1")
+    q.keyboard.press("Space")
+    wait_state(q, RUN_STATES, 10)
+    time.sleep(1)
+    none = q.evaluate("document.querySelector('.rocket.ghost.champ').hidden && document.querySelector('.rocket.ghost.avg').hidden")
+    check(none, "記録の無い部門でゴーストが出た")
+    wait_state(q, "result", 30)
+    name_and_close(q, "E")
+    # 部門を選ばずに飛ぶ → 結果で「ぶもんを えらんでね」→ 4 キーで おとな
+    seen = fly(q)
+    check(seen["cells"][2] == "ぶもんを えらんでね", f"部門なしの結果: {seen['cells']}")
+    q.keyboard.press("Digit4")
+    q.wait_for_function("document.querySelector('#cell-2 .cell-v').textContent === 'おとな 1 い'", timeout=3000)
+    name_and_close(q, "F")
+    rs = records(env, q)
+    divs = {r["name"]: r.get("division") for r in rs}
+    check(divs == {"A": "low", "B": "low", "C": "low", "D": "low", "E": "k", "F": "adult"}, f"部門: {divs}")
+    cols = q.evaluate("[...document.querySelectorAll('.rank-cols section')].map(s => [s.querySelector('h3').textContent, [...s.querySelectorAll('li .n')].map(x => x.textContent)])")
+    check(cols[1][1][0] == "D" and cols[0][1] == ["E"] and cols[3][1] == ["F"] and cols[2][1] == [], f"ランキング: {cols}")
+    csv = download_csv(q)
+    check("部門,部門内順位" in csv and ",D,1〜3ねんせい,1," in csv, f"CSV: {csv[:300]!r}")
+    return f"部門別ランキング {cols}"
+
+
+def phone_url(env):
+    h = api(env.base, "/api/health")
+    check(h.get("lan") and h.get("phoneUrls"), f"LAN に公開されていない: {h}")
+    return h["phoneUrls"][0]
+
+
+def s22_phone(env):
+    """スマホ受付: 順番待ちに登録 → PC で呼ぶと名前・部門つきで飛ぶ → 結果にスマホから名前を付けなおす"""
+    env.fresh({"divisions": True, "endlessMaxSec": 3})
+    url = phone_url(env)
+    p = env.page("tone-20")
+    m = env.browser("silence").new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    env.contexts.append(m)
+    ph = m.new_page()
+    ph.errors = []
+    ph.on("pageerror", lambda e: ph.errors.append(str(e)))
+    ph.goto(url)
+    ph.wait_for_selector("#conn.ok", timeout=10000)
+    for name, div in (("はると", "low"), ("ゆい", "k")):
+        ph.fill("#name", name)
+        ph.click(f"#divs button[data-div={div}]")
+        ph.click("#add")
+        ph.wait_for_function(f"document.querySelectorAll('#queue li .qn').length >= {1 if name == 'はると' else 2}", timeout=5000)
+    p.wait_for_function("document.querySelectorAll('#queue-list li').length === 2", timeout=5000)
+    check("はると" in p.text_content("#strip"), f"卓の案内: {p.text_content('#strip')}")
+    # 呼んで中断 → 先頭に戻る
+    p.keyboard.press("Space")
+    wait_state(p, ("standby",) + RUN_STATES, 5)
+    p.keyboard.press("Escape")
+    wait_state(p, "idle", 5)
+    check("はると" in p.text_content("#strip"), "中断した人が先頭に戻らない")
+    seen = fly(p)
+    check(seen["cells"][2] == "1〜3ねん 1 い", f"結果: {seen['cells']}")
+    check(p.input_value("#result-name") == "はると", "名前が入っていない")
+    ph.wait_for_function("document.querySelectorAll('#queue li .qn').length === 1", timeout=5000)
+    ph.wait_for_selector(".res.latest", timeout=5000)
+    ph.fill(".res.latest input[type=text]", "はるとくん")
+    ph.click(".res.latest .save")
+    p.wait_for_function("document.getElementById('result-name').value === 'はるとくん'", timeout=5000)
+    p.keyboard.press("Enter")
+    wait_state(p, "idle")
+    wait_saved(p)
+    rs = records(env, p)
+    check([(r["name"], r["division"]) for r in rs] == [("はるとくん", "low")], f"記録: {rs}")
+    check("ゆい" in p.text_content("#strip"), "次の人が出ない")
+    # あとから部門を変える（スマホ）
+    ph.click(".res.latest .divs button[data-div=high]")
+    p.wait_for_function("window.__kitano.records[0].division === 'high'", timeout=5000)
+    wait_saved(p)
+    check(records(env, p)[0]["division"] == "high", "スマホで変えた部門がファイルに入らない")
+    # LAN からは PC の画面・記録は見えない
+    lan = url.split("/phone.html")[0]
+    code = ph.evaluate(f"fetch('{lan}/api/records/' + new Date().toISOString().slice(0,10)).then(r => r.status)")
+    check(code == 403, f"LAN から記録が見えた: {code}")
+    check(not ph.errors, f"スマホ画面のエラー: {ph.errors}")
+    return "登録→呼び出し→中断で先頭へ→名前つきで記録→スマホで名前・部門を修正"
+
+
 SCENARIOS = [
     ("S1", "計測精度（70/80/90dB）", s1_accuracy),
     ("S2", "80dB: つき到達→エンドレス", s2_flow_loud),
@@ -732,6 +838,8 @@ SCENARIOS = [
     ("S18", "大量データ（800件）", s18_many_records),
     ("S19", "日付またぎ", s19_date_rollover),
     ("S20", "BGM の自動停止", s20_bgm),
+    ("S21", "部門とへいきんゴースト", s21_divisions),
+    ("S22", "スマホ受付", s22_phone),
 ]
 
 

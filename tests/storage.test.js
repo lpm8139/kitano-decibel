@@ -127,6 +127,21 @@ test('normalizeSettings: 旧版の設定ファイルは floor を既定に戻し
   assert.equal(normalizeSettings({ ...s, floor: 40 }).floor, 40); // ロケット版の設定なら floor はそのまま
 });
 
+test('部門: 名前・正規化・絞り込み', async () => {
+  const { DIVISIONS, divisionName, normalizeDivision, inDivision } = await import('../js/storage.js');
+  assert.deepEqual(DIVISIONS.map((d) => d.key), ['k', 'low', 'high', 'adult']);
+  assert.equal(divisionName('k'), 'ようちえん');
+  assert.equal(divisionName('high', true), '4〜6ねん');
+  assert.equal(divisionName(''), '');
+  assert.equal(normalizeDivision('low'), 'low');
+  assert.equal(normalizeDivision('adult'), 'adult');
+  assert.equal(normalizeDivision('teen'), '');
+  const rs = [rec('a', 1, 1, { division: 'k' }), rec('b', 2, 2), rec('c', 3, 3, { division: 'k' })];
+  assert.deepEqual(inDivision(rs, 'k').map((r) => r.id), ['a', 'c']);
+  assert.deepEqual(inDivision(rs, '').map((r) => r.id), ['b']);
+  assert.equal(inDivision(rs, null).length, 3);
+});
+
 // ---- CSV ----
 
 test('csvEscape / neutralizeFormula', () => {
@@ -143,14 +158,16 @@ test('csvEscape / neutralizeFormula', () => {
 test('buildCsv: BOM・ヘッダ・高さ順・場所名・エスケープ', () => {
   const t = new Date(2026, 9, 9, 10, 0, 0).getTime();
   const csv = buildCsv([
-    rec('a', 520, t, { name: 'A,B', meanDb: 72.25, reached: 'moon', boosted: true }),
-    rec('b', 1650.4, t + 1000, { name: '=evil', meanDb: 88.1, reached: 'saturn', clipped: true }),
+    rec('a', 520, t, { name: 'A,B', meanDb: 72.25, reached: 'moon', boosted: true, division: 'low' }),
+    rec('b', 1650.4, t + 1000, { name: '=evil', meanDb: 88.1, reached: 'saturn', clipped: true, division: 'high' }),
+    rec('c', 600, t + 2000, { name: 'C', meanDb: 70, reached: 'moon', division: 'low' }),
   ]);
-  assert.ok(csv.startsWith('\ufeff順位,名前,高さ(km),とどいた場所,平均dB,ブースター,記録時刻,クリップ\r\n'));
+  assert.ok(csv.startsWith('\ufeff順位,名前,部門,部門内順位,高さ(km),とどいた場所,平均dB,ブースター,記録時刻,クリップ\r\n'));
   const lines = csv.trim().split('\r\n');
-  assert.equal(lines.length, 3);
-  assert.equal(lines[1], "1,'=evil,1650,どせい,88.1,,2026-10-09 10:00:01,あり");
-  assert.equal(lines[2], `2,"A,B",520,つき,${(72.25).toFixed(1)},あり,2026-10-09 10:00:00,`);
+  assert.equal(lines.length, 4);
+  assert.equal(lines[1], "1,'=evil,4〜6ねんせい,1,1650,どせい,88.1,,2026-10-09 10:00:01,あり");
+  assert.equal(lines[2], '2,C,1〜3ねんせい,1,600,つき,70.0,,2026-10-09 10:00:02,');
+  assert.equal(lines[3], `3,"A,B",1〜3ねんせい,2,520,つき,${(72.25).toFixed(1)},あり,2026-10-09 10:00:00,`);
   assert.equal(buildCsv([]).trim().split('\r\n').length, 1); // ヘッダのみ
 });
 

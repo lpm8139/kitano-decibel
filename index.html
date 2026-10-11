@@ -37,7 +37,6 @@
           <div class="speedlines" aria-hidden="true"></div>
           <div id="world" class="world"></div>
 
-          <div id="ghost-hint" class="ghost-hint" hidden></div>
           <div id="idle-caption" class="idle-caption">
             <div class="big">はっしゃ じゅんび OK！</div>
             <div class="sub">★うちゅう → ★つき → ∞エンドレス を めざそう</div>
@@ -89,15 +88,25 @@
             <div class="cheer-title">ブースター はっしゃちゅう！</div>
             <div class="cheer-note">このあと ∞エンドレスモード。もういちど こえを だそう！</div>
           </div>
+          <div class="side-panel" data-panel="queue">
+            <div class="queue-title">つぎの うちゅうひこうし</div>
+            <ol id="queue-list" class="queue-list"></ol>
+          </div>
           <div class="side-panel" data-panel="name">
             <div class="name-q">うちゅうひこうしの なまえを おしえてね</div>
             <input id="result-name" class="name-input" type="text" maxlength="20" autocomplete="off" spellcheck="false" aria-label="なまえ">
-            <div class="name-help">（スタッフ用）Enter で けってい ／ Esc で なまえなし ／ <button type="button" id="btn-discard" class="link-btn">この きろくを はき</button></div>
+            <div id="div-buttons" class="div-buttons">
+              <button type="button" data-div="k"><b>1</b>ようちえん</button>
+              <button type="button" data-div="low"><b>2</b>1〜3ねん</button>
+              <button type="button" data-div="high"><b>3</b>4〜6ねん</button>
+              <button type="button" data-div="adult"><b>4</b>おとな</button>
+            </div>
+            <div class="name-help">（スタッフ用）Enter けってい ／ Esc なまえなし ／ 1〜4 ぶもん ／ <button type="button" id="btn-discard" class="link-btn">この きろくを はき</button></div>
           </div>
           <div class="side-panel" data-panel="score">
             <div class="db-big score-big"><span id="score-big">0</span></div>
             <div class="db-sub">km（とどいた たかさ）</div>
-            <div class="name-help">（スタッフ用）Space で つぎの ひと ／ Enter・Esc で たいき ／ Delete で きろくを はき</div>
+            <div class="name-help">（スタッフ用）Space つぎの ひと ／ Enter・Esc たいき ／ 1〜4 ぶもん ／ Delete はき</div>
           </div>
         </div>
       </section>
@@ -118,7 +127,7 @@
       <div class="mon-title rank-title">きょうの ランキング（とどいた たかさ）</div>
       <section class="monitor mon-rank">
         <div class="screen space">
-          <ol id="rank-list" class="rank-list"></ol>
+          <div id="rank-list" class="rank-list"></div>
         </div>
       </section>
 
@@ -164,6 +173,7 @@
     </div>
   </div>
 
+  <script src="vendor/qrcode.js"></script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

@@ -3,6 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BOOSTER_SEC,
+  averageSeries,
   thin,
   RocketRun,
   altitudeAt,
@@ -159,4 +160,17 @@ test('thin: 間隔を空けて間引き、最後の点は残す', () => {
   assert.deepEqual(thin(s, 100).map(([t]) => t), [0, 100, 200, 300, 400, 500]);
   assert.deepEqual(thin([], 100), []);
   assert.deepEqual(thin([[0, 1], [30, 2]], 100), [[0, 1], [30, 2]]);
+});
+
+test('averageSeries: 時刻ごとの平均。先に飛び終わった人は最後の高さのまま', () => {
+  const a = [[0, 0], [1000, 100], [2000, 200]];
+  const b = [[0, 0], [1000, 300]]; // 1秒で終わり（300 のまま）
+  const avg = averageSeries([a, b], 500);
+  assert.deepEqual(avg, [[0, 0], [500, 100], [1000, 200], [1500, 225], [2000, 250]]);
+  assert.deepEqual(averageSeries([]), []);
+  assert.deepEqual(averageSeries([[[0, 5]]]), [[0, 5]]);
+  for (let i = 1; i < avg.length; i++) assert.ok(avg[i][1] >= avg[i - 1][1]);
+  // altitudeAt と同じ値になる（1本だけなら元の履歴をなぞる）
+  const one = averageSeries([a], 250);
+  for (const [t, v] of one) assert.equal(v, Math.round(altitudeAt(a, t)));
 });

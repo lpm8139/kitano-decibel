@@ -220,6 +220,75 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertEqual(len(merged), 1700)
 
+    def test_lobby_ops(self):
+        """受付: 登録・取り消し・結果の追加（PC だけ）・後から名前・全消去。rev が進み、lobby.json に残る"""
+        st, lb0 = req(self.base, "/api/lobby")
+        self.assertEqual(st, 200)
+        rev0 = lb0["rev"]
+        st, lb = req(self.base, "/api/lobby", {"op": "add", "name": "  はると  ", "division": "low"})
+        self.assertEqual(st, 200)
+        self.assertEqual(lb["rev"], rev0 + 1)
+        self.assertEqual((lb["queue"][-1]["name"], lb["queue"][-1]["division"]), ("はると", "low"))
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "add", "name": "せんせい", "division": "adult"})[1]["queue"][-1]["division"], "adult")
+        st, lb = req(self.base, "/api/lobby", {"op": "add", "name": "あ" * 30, "division": "zzz"})
+        self.assertEqual((len(lb["queue"][-1]["name"]), lb["queue"][-1]["division"]), (20, ""))
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "add", "name": " ", "division": ""})[0], 400)
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "nope"})[0], 400)
+        first = lb["queue"][-2]["id"]
+        st, lb = req(self.base, "/api/lobby", {"op": "remove", "id": first})
+        self.assertNotIn(first, [x["id"] for x in lb["queue"]])
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "remove", "id": first})[0], 200)  # 2回目もエラーにしない
+        st, lb = req(self.base, "/api/lobby", {"op": "result", "entry": {"recordId": "r1", "score": 820, "reached": "mars", "name": "", "division": "", "ts": 1, "updatedAt": 5}})
+        self.assertEqual(lb["recent"][-1]["recordId"], "r1")
+        st, lb = req(self.base, "/api/lobby", {"op": "edit", "recordId": "r1", "name": "ゆい", "division": "k"})
+        r1 = [x for x in lb["recent"] if x["recordId"] == "r1"][0]
+        self.assertEqual((r1["name"], r1["division"]), ("ゆい", "k"))
+        self.assertGreater(r1["updatedAt"], 5)
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "edit", "recordId": "none", "name": "x"})[0], 404)
+        for i in range(10):
+            req(self.base, "/api/lobby", {"op": "result", "entry": {"recordId": "m%d" % i, "score": i, "ts": 100 + i}})
+        lb = req(self.base, "/api/lobby")[1]
+        self.assertEqual(len(lb["recent"]), 8)
+        self.assertEqual(lb["recent"][-1]["recordId"], "m9")
+        st, lb = req(self.base, "/api/lobby", {"op": "clear"})
+        self.assertEqual(lb["queue"], [])
+        self.assertEqual(self.read_file("lobby.json")["rev"], lb["rev"])
+
+    def test_lan_only_phone(self):
+        """PC 以外（LAN）からは、受付ページと合言葉付きの受付 API だけ。記録・設定・アプリ本体は見えない"""
+        h = req(self.base, "/api/health")[1]
+        if not h.get("lan") or not h.get("phoneUrls"):
+            self.skipTest("LAN のアドレスが無い環境")
+        from urllib.parse import urlparse
+        u = urlparse(h["phoneUrls"][0])
+        lan = "http://%s" % u.netloc
+        key = h["phoneKey"]
+        self.assertIn("k=" + key, h["phoneUrls"][0])
+
+        def code(path, body=None, headers=None):
+            data = None if body is None else json.dumps(body).encode("utf-8")
+            r = urllib.request.Request(lan + path, data=data, method="POST" if data else "GET",
+                                       headers={"Content-Type": "application/json", **(headers or {})})
+            try:
+                with urllib.request.urlopen(r, timeout=10) as res:
+                    return res.status, res.read()
+            except urllib.error.HTTPError as e:
+                return e.code, b""
+
+        self.assertEqual(code("/phone.html")[0], 200)
+        self.assertEqual(code("/phone")[0], 200)
+        for path in ["/", "/index.html", "/js/app.js", "/api/health", "/api/settings", "/api/records/2026-10-01", "/api/sounds", "/api/lobby"]:
+            self.assertEqual(code(path)[0], 403, path)
+        self.assertEqual(code("/api/lobby?k=wrongkey")[0], 403)
+        self.assertEqual(code("/api/settings", {"offset": 1})[0], 403)
+        self.assertEqual(code("/api/records/2026-10-01", [rec("x", 1)])[0], 403)
+        st, body = code("/api/lobby?k=" + key)
+        self.assertEqual(st, 200)
+        self.assertEqual(code("/api/lobby", {"op": "add", "name": "スマホ", "division": "k"}, {"X-Kitano-Key": key})[0], 200)
+        self.assertEqual(code("/api/lobby?k=" + key, {"op": "clear"})[0], 403)  # 全消去と結果の追加は PC だけ
+        self.assertEqual(code("/api/lobby?k=" + key, {"op": "result", "entry": {"recordId": "z"}})[0], 403)
+        self.assertIn("スマホ", [x["name"] for x in req(self.base, "/api/lobby")[1]["queue"]])
+
     def test_persists_across_restart(self):
         d = "2026-10-06"
         req(self.base, "/api/records/" + d, [rec("keep", 1)])

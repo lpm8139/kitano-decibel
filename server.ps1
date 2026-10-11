@@ -1,9 +1,13 @@
-﻿# server.ps1 — 声の大きさ競争 の保存サーバー（PowerShell 版）
+﻿# server.ps1 — ロケット かんせいしつ の保存サーバー（PowerShell 版）
 #
 # Python が入っていない Windows PC 用の予備サーバー。Windows 標準の PowerShell 5.1 だけで動く。
 # server.py と同じ API・同じ保存形式（どちらで起動しても同じ data/ フォルダを使える）。
 #
 #   GET  /api/health / GET・POST /api/records/<YYYY-MM-DD> / GET・POST /api/settings / GET /api/sounds
+#   GET・POST /api/lobby（スマホ受付）
+#
+# スマホ受付: http://+:<port>/ で待ち受けられたときだけ LAN に公開する（Windows では管理者権限か URL 予約が必要。
+# だめなら localhost だけで動き、スマホ受付は使えない）。PC 以外からは /phone.html と合言葉付きの /api/lobby だけ許可。
 #
 # 保存の仕組み（server.py と同じ）
 #   data/<日付>.json              … その日の全記録（tmp に書いてから置き換え＝途中で落ちても壊れない）
@@ -16,7 +20,8 @@
 param(
   [int]$Port = 0,
   [string]$DataDir = '',
-  [switch]$NoBrowser
+  [switch]$NoBrowser,
+  [switch]$LocalOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -207,6 +212,136 @@ function Save-Records([string]$date, $incoming) {
   return $mergedText
 }
 
+
+# ---------------------------------------------------------------------------
+# 受付（スマホで名前と部門を登録 → PC の順番待ち。server.py と同じ規則）
+# ---------------------------------------------------------------------------
+
+$Divisions = @('', 'k', 'low', 'high', 'adult')
+$script:Lobby = $null
+$script:Lan = $false
+
+function Get-NowMs { return [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+function Get-CleanName($v) { $t = ([string]$v).Trim(); if ($t.Length -gt 20) { $t = $t.Substring(0, 20) }; return [string]$t }
+function Get-CleanDiv($v) { $t = [string]$v; if ($Divisions -contains $t) { return $t }; return '' }
+
+function Get-Lobby {
+  if ($null -eq $script:Lobby) {
+    $d = Read-JsonFile (Join-Path $script:DataDirFull 'lobby.json') $null
+    $q = New-Object System.Collections.ArrayList
+    $r = New-Object System.Collections.ArrayList
+    $rev = 0
+    if (Test-Dict $d) {
+      if (Test-Number $d['rev']) { $rev = [int]$d['rev'] }
+      if (Test-List $d['queue']) { foreach ($x in $d['queue']) { if ((Test-Dict $x) -and ($x['id'] -is [string])) { [void]$q.Add($x) } } }
+      if (Test-List $d['recent']) { foreach ($x in $d['recent']) { if ((Test-Dict $x) -and ($x['recordId'] -is [string])) { [void]$r.Add($x) } } }
+    }
+    $script:Lobby = @{ rev = [int]$rev; queue = $q; recent = $r }
+  }
+  return $script:Lobby
+}
+
+function Save-Lobby {
+  $script:Lobby['rev'] = [int]$script:Lobby['rev'] + 1
+  Write-Atomic (Join-Path $script:DataDirFull 'lobby.json') (ConvertTo-JsonText $script:Lobby)
+}
+
+# 戻り値: @{ status = 200 / 400 ...; message = ... }
+function Invoke-LobbyOp($body, [bool]$local) {
+  if (-not (Test-Dict $body)) { return @{ status = 400; message = 'lobby op must be an object' } }
+  $lb = Get-Lobby
+  $op = [string]$body['op']
+  if ($op -eq 'add') {
+    $name = Get-CleanName $body['name']; $div = Get-CleanDiv $body['division']
+    if (-not $name -and -not $div) { return @{ status = 400; message = 'name or division required' } }
+    if ($lb['queue'].Count -ge 60) { return @{ status = 409; message = 'queue is full' } }
+    $bytes = New-Object byte[] 6
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $id = [string](($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
+    [void]$lb['queue'].Add(@{ id = $id; name = $name; division = $div; ts = (Get-NowMs) })
+  } elseif ($op -eq 'remove') {
+    $target = [string]$body['id']
+    $keep = New-Object System.Collections.ArrayList
+    foreach ($x in $lb['queue']) { if ([string]$x['id'] -ne $target) { [void]$keep.Add($x) } }
+    if ($keep.Count -eq $lb['queue'].Count) { return @{ status = 200 } }
+    $lb['queue'] = $keep
+  } elseif ($op -eq 'edit') {
+    $hit = $null
+    foreach ($x in $lb['recent']) { if ([string]$x['recordId'] -eq [string]$body['recordId']) { $hit = $x } }
+    if ($null -eq $hit) { return @{ status = 404; message = 'record not in recent' } }
+    $hit['name'] = Get-CleanName $body['name']
+    $hit['division'] = Get-CleanDiv $body['division']
+    $hit['updatedAt'] = Get-NowMs
+  } elseif ($op -eq 'result' -and $local) {
+    $e = $body['entry']
+    if (-not (Test-Dict $e) -or -not ($e['recordId'] -is [string])) { return @{ status = 400; message = 'entry.recordId required' } }
+    $ts = Get-NowMs; if (Test-Number $e['ts']) { $ts = [long]$e['ts'] }
+    $up = Get-NowMs; if (Test-Number $e['updatedAt']) { $up = [long]$e['updatedAt'] }
+    $score = $null; if (Test-Number $e['score']) { $score = [double]$e['score'] }
+    $entry = @{ recordId = [string]$e['recordId']; score = $score; reached = [string]$e['reached']; name = (Get-CleanName $e['name']);
+                division = (Get-CleanDiv $e['division']); ts = $ts; updatedAt = $up }
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($x in $lb['recent']) { if ([string]$x['recordId'] -ne $entry['recordId']) { $list.Add($x) } }
+    $list.Add($entry)
+    $list.Sort([System.Comparison[object]] { param($a, $b) ([double]$a['ts']).CompareTo([double]$b['ts']) })
+    $keep = New-Object System.Collections.ArrayList
+    $start = [Math]::Max(0, $list.Count - 8)
+    for ($i = $start; $i -lt $list.Count; $i++) { [void]$keep.Add($list[$i]) }
+    $lb['recent'] = $keep
+  } elseif ($op -eq 'clear' -and $local) {
+    $lb['queue'] = New-Object System.Collections.ArrayList
+  } elseif ($op -eq 'result' -or $op -eq 'clear') {
+    return @{ status = 403; message = 'PC only' }
+  } else {
+    return @{ status = 400; message = 'unknown op' }
+  }
+  Save-Lobby
+  return @{ status = 200 }
+}
+
+function Get-PhoneKey {
+  $path = Join-Path $script:DataDirFull 'phone-key.txt'
+  try {
+    if ([System.IO.File]::Exists($path)) {
+      $k = [System.IO.File]::ReadAllText($path).Trim()
+      if ($k -match '^[a-z0-9]{6,32}$') { return [string]$k }
+    }
+  } catch { }
+  $chars = 'abcdefghjkmnpqrstuvwxyz23456789'
+  $bytes = New-Object byte[] 8
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  $k = [string](($bytes | ForEach-Object { $chars[$_ % $chars.Length] }) -join '')
+  try { [System.IO.File]::WriteAllText($path, $k) } catch { }
+  return $k
+}
+
+function Get-LanAddresses {
+  $set = New-Object System.Collections.Generic.List[string]
+  try {
+    foreach ($a in [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName())) {
+      if ($a.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { $set.Add([string]$a.ToString()) }
+    }
+  } catch { }
+  try {
+    $u = New-Object System.Net.Sockets.Socket([System.Net.Sockets.AddressFamily]::InterNetwork, [System.Net.Sockets.SocketType]::Dgram, [System.Net.Sockets.ProtocolType]::Udp)
+    $u.Connect('10.255.255.255', 1)
+    $set.Add([string]$u.LocalEndPoint.Address.ToString())
+    $u.Close()
+  } catch { }
+  $out = New-Object System.Collections.Generic.List[string]
+  foreach ($ip in $set) {
+    if ($ip.StartsWith('127.') -or $ip.StartsWith('169.254.') -or $ip.StartsWith('0.') -or $out.Contains($ip)) { continue }
+    if ($ip.StartsWith('192.168.137.')) { $out.Insert(0, $ip) } else { $out.Add($ip) }
+  }
+  return , $out.ToArray()
+}
+
+function Test-KeyOk($ctx) {
+  $sent = [string]$ctx.Request.Headers['X-Kitano-Key']
+  if (-not $sent) { $sent = [string]$ctx.Request.QueryString['k'] }
+  return ($sent -ne '') -and ($sent -ceq (Get-PhoneKey))
+}
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -285,7 +420,10 @@ function Send-Static($ctx, [string]$urlPath) {
 function Invoke-Request($ctx) {
   $path = $ctx.Request.Url.AbsolutePath
   $method = $ctx.Request.HttpMethod
+  $local = [System.Net.IPAddress]::IsLoopback($ctx.Request.RemoteEndPoint.Address)
+  if ($path -eq '/phone') { $path = '/phone.html' }
   if (-not $path.StartsWith('/api/')) {
+    if (-not $local -and $path -ne '/phone.html') { Send-Error $ctx 403 'forbidden'; return }
     if ($method -eq 'GET' -or $method -eq 'HEAD') { Send-Static $ctx $path } else { Send-Error $ctx 404 'not found' }
     return
   }
@@ -293,12 +431,29 @@ function Invoke-Request($ctx) {
   $name = $parts[0]
   $rest = @()
   if ($parts.Count -gt 1) { $rest = @($parts[1..($parts.Count - 1)]) }
+  # PC 以外（LAN）からは、合言葉付きの受付 API だけ
+  if (-not $local -and -not ($name -eq 'lobby' -and (Test-KeyOk $ctx))) { [void](Read-BodyText $ctx); Send-Error $ctx 403 'forbidden'; return }
+
+  if ($name -eq 'lobby' -and $rest.Count -eq 0) {
+    if ($method -eq 'GET') { Send-JsonText $ctx (ConvertTo-JsonText (Get-Lobby)); return }
+    if ($method -eq 'POST') {
+      $bodyText = Read-BodyText $ctx
+      try { $body = ConvertFrom-Body $bodyText } catch { Send-Error $ctx 400 'invalid json'; return }
+      $res = Invoke-LobbyOp $body $local
+      if ($res['status'] -ne 200) { Send-Error $ctx ([int]$res['status']) ([string]$res['message']); return }
+      Send-JsonText $ctx (ConvertTo-JsonText (Get-Lobby)); return
+    }
+  }
 
   if ($method -eq 'GET') {
     if ($name -eq 'health' -and $rest.Count -eq 0) {
       # 値は必ず素の string/int にする。Join-Path などの出力は PSObject で包まれていて、
       # Windows PowerShell 5.1 の JavaScriptSerializer が循環参照エラーになる（Windows 実機で確認）
-      $h = @{ ok = $true; server = 'powershell'; dataDir = [string]$script:DataDirFull; port = [int]$script:PortUsed }
+      $key = Get-PhoneKey
+      $urls = New-Object System.Collections.Generic.List[string]
+      if ($script:Lan) { foreach ($ip in (Get-LanAddresses)) { $urls.Add([string]"http://${ip}:$($script:PortUsed)/phone.html?k=$key") } }
+      $h = @{ ok = $true; server = 'powershell'; dataDir = [string]$script:DataDirFull; port = [int]$script:PortUsed;
+              lan = [bool]$script:Lan; phoneKey = [string]$key; phoneUrls = [string[]]$urls.ToArray() }
       Send-JsonText $ctx (ConvertTo-JsonText $h); return
     }
     if ($name -eq 'records' -and $rest.Count -eq 1 -and $rest[0] -match $DateRe) {
@@ -438,16 +593,23 @@ $candidates = if ($Port -gt 0) { @($Port) } else { 8000..8010 }
 $listener = $null
 foreach ($p in $candidates) {
   if (-not (Test-PortFree $p)) { continue }
-  $l = New-Object System.Net.HttpListener
-  $l.Prefixes.Add("http://localhost:$p/")
-  try {
-    $l.Start()
-    $listener = $l
-    $script:PortUsed = $p
-    break
-  } catch {
-    try { $l.Close() } catch { }
+  # まず LAN にも公開（スマホ受付用）を試し、権限が無ければ localhost だけ
+  $hosts = @('localhost')
+  if (-not $LocalOnly) { $hosts = @('+', 'localhost') }
+  foreach ($h in $hosts) {
+    $l = New-Object System.Net.HttpListener
+    $l.Prefixes.Add("http://${h}:$p/")
+    try {
+      $l.Start()
+      $listener = $l
+      $script:PortUsed = $p
+      $script:Lan = ($h -eq '+')
+      break
+    } catch {
+      try { $l.Close() } catch { }
+    }
   }
+  if ($listener) { break }
 }
 if (-not $listener) {
   Write-Host "[NG] ポート $($candidates[0])〜$($candidates[-1]) がすべて使用中です。他のサーバーを閉じてから再実行してください。"
@@ -458,6 +620,16 @@ if ($Port -le 0 -and $script:PortUsed -ne 8000) {
 }
 $url = "http://localhost:$($script:PortUsed)/"
 [void]$lines.Add("[OK] アドレス: $url")
+[void](Get-PhoneKey)
+if ($script:Lan) {
+  $ipList = New-Object System.Collections.Generic.List[string]
+  foreach ($ip in (Get-LanAddresses)) { $ipList.Add("${ip}:$($script:PortUsed)") }
+  $ips = $ipList -join ', '
+  if (-not $ips) { $ips = 'ネットワーク未接続。テザリングをオンにすると使えます' }
+  [void]$lines.Add("[OK] スマホ受付: 管理者画面の QR コードから（$ips）")
+} else {
+  [void]$lines.Add('[注意] スマホ受付は使えません（PowerShell 版は管理者として実行したときだけ LAN に公開できます）。PC だけで遊べます')
+}
 
 $browser = Find-Browser
 if (-not $NoBrowser) { [void]$lines.Add("[OK] ブラウザ: $($browser.Label)") }

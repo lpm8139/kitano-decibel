@@ -14,6 +14,7 @@ export function rocketSvg({ body = '#FFFFFF', accent = '#FF5A5F', flame = true, 
 }
 
 export const ghostRocketSvg = (width = 72) => rocketSvg({ body: '#E4DDFF', accent: '#8B7CF6', width });
+export const avgRocketSvg = (width = 64) => rocketSvg({ body: '#D3F5EE', accent: '#22A699', width });
 
 /** 星のイラスト。d = 直径(px)。土星だけ輪のぶん横に広い（幅 = d × 1.7）。 */
 export function planetSvg(kind, d) {

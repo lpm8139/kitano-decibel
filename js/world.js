@@ -3,7 +3,7 @@
 // DOM は最初（と目標の高さが変わったとき）に作り、毎フレームは transform だけ更新する。
 
 import { landmarksFor } from './game.js';
-import { ghostRocketSvg, planetSvg, planetWidth, rocketSvg } from './art.js';
+import { avgRocketSvg, ghostRocketSvg, planetSvg, planetWidth, rocketSvg } from './art.js';
 
 /** 高さ → 世界座標(px)。√ にすると、低いところ（くも・うちゅう）も高いところ（どせい…）も間隔がほどよくそろう。 */
 export const PX_SCALE = 60;
@@ -38,7 +38,17 @@ export class WorldView {
     this.world = screen.querySelector('#world');
     this.farStars = screen.querySelector('#stars-far');
     this.nearStars = screen.querySelector('#stars-near');
-    this.hint = screen.querySelector('#ghost-hint');
+    // ゴースト（チャンピオン・へいきん）が画面の外にいるときの「○km さき」表示
+    this.hints = {};
+    screen.querySelector('#ghost-hint')?.remove();
+    for (const [key, cls] of [['champ', 'champ'], ['avg', 'avg']]) {
+      const el = document.createElement('div');
+      el.className = `ghost-hint ${cls}`;
+      el.hidden = true;
+      screen.append(el);
+      this.hints[key] = el;
+    }
+    this.ghostNames = { champ: 'チャンピオン', avg: 'へいきん' };
     this.cam = 0;
     this.marks = [];
     this.goalEls = {};
@@ -102,20 +112,30 @@ export class WorldView {
       if (m.goal) this.goalEls[m.goal] = { el: el.firstElementChild, label: el.querySelector('.mark-label'), m };
     }
 
-    // ロケット（きみ・チャンピオン）
-    this.ghost = document.createElement('div');
-    this.ghost.className = 'rocket ghost';
-    this.ghost.innerHTML = `${ghostRocketSvg(70)}<div class="rocket-label">チャンピオン</div>`;
+    // ロケット（きみ・チャンピオン・へいきん）
+    this.ghosts = {};
+    for (const [key, svg] of [['avg', avgRocketSvg(64)], ['champ', ghostRocketSvg(70)]]) {
+      const el = document.createElement('div');
+      el.className = `rocket ghost ${key}`;
+      el.innerHTML = `${svg}<div class="rocket-label"></div>`;
+      el.hidden = true;
+      w.append(el);
+      this.ghosts[key] = { el, label: el.querySelector('.rocket-label') };
+    }
     this.you = document.createElement('div');
     this.you.className = 'rocket you';
     this.you.innerHTML = `${rocketSvg({ width: 90 })}<div class="rocket-label">きみ</div>`;
-    w.append(this.ghost, this.you);
-    this.ghostLabel = this.ghost.querySelector('.rocket-label');
+    w.append(this.you);
+    this.setGhostNames(this.ghostNames);
     this.resetGoals();
   }
 
-  setGhostName(text) {
-    if (this.ghostLabel) this.ghostLabel.textContent = text;
+  /** ゴーストの名前（ロケットの横と、画面外の表示に使う）。 */
+  setGhostNames({ champ, avg }) {
+    this.ghostNames = { champ: champ ?? this.ghostNames.champ, avg: avg ?? this.ghostNames.avg };
+    if (!this.ghosts) return;
+    this.ghosts.champ.label.textContent = this.ghostNames.champ;
+    this.ghosts.avg.label.textContent = this.ghostNames.avg;
   }
 
   resetGoals() {
@@ -134,16 +154,15 @@ export class WorldView {
 
   /**
    * 毎フレーム呼ぶ。
-   * @param {{alt:number, ghostAlt:number|null, ghostAhead?:string, thrust:number, dt:number}} p
+   * @param {{alt:number, ghosts?:{champ?:number|null, avg?:number|null}, thrust:number, dt:number, snap?:boolean}} p
    */
-  update({ alt, ghostAlt, thrust, dt, snap = false }) {
+  update({ alt, ghosts = {}, thrust, dt, snap = false }) {
     const H = this.screen.clientHeight || 722;
     const youY = worldY(alt);
     const target = cameraFor(youY, H);
     // カメラはなめらかに追いかける（いきなり飛ばない）。snap = 待機に戻ったときなどは即座に。
     const k = snap ? 1 : 1 - Math.exp(-dt / 0.12);
     this.cam += (target - this.cam) * k;
-    if (this.cam > youY) this.cam = Math.max(0, target);
 
     this.world.style.transform = `translateY(${this.cam.toFixed(1)}px)`;
     this.you.style.transform = `translateY(${(-youY).toFixed(1)}px)`;
@@ -151,25 +170,41 @@ export class WorldView {
     this.farStars.style.transform = `translateY(${((this.cam * 0.08) % 260).toFixed(1)}px)`;
     this.nearStars.style.transform = `translateY(${((this.cam * 0.2) % 420).toFixed(1)}px)`;
 
-    if (ghostAlt === null || ghostAlt === undefined) {
-      this.hint.hidden = true;
-      return;
-    }
-    const gY = worldY(ghostAlt);
-    this.ghost.style.transform = `translateY(${(-gY).toFixed(1)}px)`;
-    // 画面の外にいるときは、上か下のはしに「チャンピオン ○km さき」を出す
-    const screenBottomOfGhost = H - GROUND_PAD - (gY - this.cam); // ゴーストの足元の画面Y
-    const diff = Math.round(ghostAlt - alt);
-    if (screenBottomOfGhost < 40) {
-      this.hint.hidden = false;
-      this.hint.dataset.dir = 'up';
-      this.hint.textContent = `▲ チャンピオン ${diff.toLocaleString('ja-JP')}km さき`;
-    } else if (screenBottomOfGhost - 130 > H) {
-      this.hint.hidden = false;
-      this.hint.dataset.dir = 'down';
-      this.hint.textContent = `▼ チャンピオン ${(-diff).toLocaleString('ja-JP')}km うしろ`;
-    } else {
-      this.hint.hidden = true;
+    let row = 0;
+    for (const key of ['champ', 'avg']) {
+      const g = this.ghosts?.[key];
+      const hint = this.hints[key];
+      const gAlt = ghosts[key];
+      if (!g) continue;
+      if (gAlt === null || gAlt === undefined) {
+        g.el.hidden = true;
+        hint.hidden = true;
+        continue;
+      }
+      g.el.hidden = false;
+      const gY = worldY(gAlt);
+      g.el.style.transform = `translateY(${(-gY).toFixed(1)}px)`;
+      // 画面の外にいるときは、上か下のはしに「チャンピオン ○km さき」を出す
+      const base = H - GROUND_PAD - (gY - this.cam); // ゴーストの足元の画面Y
+      const diff = Math.round(gAlt - alt);
+      const name = this.ghostNames[key];
+      if (base < 40) {
+        hint.hidden = false;
+        hint.dataset.dir = 'up';
+        hint.style.top = `${14 + row * 46}px`;
+        hint.style.bottom = '';
+        hint.textContent = `▲ ${name} ${diff.toLocaleString('ja-JP')}km さき`;
+        row += 1;
+      } else if (base - 130 > H) {
+        hint.hidden = false;
+        hint.dataset.dir = 'down';
+        hint.style.bottom = `${80 + row * 46}px`;
+        hint.style.top = '';
+        hint.textContent = `▼ ${name} ${(-diff).toLocaleString('ja-JP')}km うしろ`;
+        row += 1;
+      } else {
+        hint.hidden = true;
+      }
     }
   }
 }

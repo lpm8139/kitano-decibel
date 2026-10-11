@@ -2,7 +2,7 @@
 // 画面の更新だけを担当する（状態管理・計算は app.js / game.js）。
 // createRenderer(document) が返すオブジェクトのメソッドを app.js から呼ぶ。
 
-import { topN } from './storage.js';
+import { DIVISIONS, divisionName, inDivision, topN } from './storage.js';
 import { WorldView } from './world.js';
 import { planetSvg, planetWidth, rocketSvg } from './art.js';
 
@@ -34,6 +34,8 @@ export function createRenderer(doc = document) {
     btnDiscard: $('btn-discard'),
     btnAdmin: $('btn-admin'),
     rankList: $('rank-list'),
+    queueList: $('queue-list'),
+    divButtons: $('div-buttons'),
     strip: $('strip'),
     stageTimer: $('stage-timer'),
     stageTimerFill: $('stage-timer-fill'),
@@ -288,6 +290,13 @@ export function createRenderer(doc = document) {
       setText(els.scoreBig, km(score));
       els.resultView.hidden = false;
     },
+    /** しんきろくの演出（結果画面。部門があとから決まったときにも呼ぶ）。 */
+    celebrate() {
+      els.newRecordPill.hidden = false;
+      els.stage.dataset.newrecord = '1';
+      this.flash();
+      this.confetti();
+    },
     hideResult() {
       els.resultView.hidden = true;
       els.newRecordPill.hidden = true;
@@ -302,18 +311,14 @@ export function createRenderer(doc = document) {
       return els.resultName.value;
     },
 
-    // ---- ランキング（上位6件・2列） ----
-    renderRanking(records, highlightId = null) {
+    // ---- ランキング ----
+    /**
+     * 部門なし: 上位6件を2列。部門あり: 4部門を横に並べて各上位3件。
+     * @param {object[]} records ランキング対象（isRankable）の記録
+     */
+    renderRanking(records, highlightId = null, { divisions = false, active = '' } = {}) {
       els.rankList.textContent = '';
-      const top = topN(records, 6);
-      if (top.length === 0) {
-        const li = doc.createElement('li');
-        li.className = 'empty';
-        li.textContent = 'まだ だれも とんでいないよ。さいしょの うちゅうひこうしに なろう！';
-        els.rankList.append(li);
-        return;
-      }
-      top.forEach((r, i) => {
+      const item = (r, i) => {
         const li = doc.createElement('li');
         if (r.id === highlightId) li.className = 'current';
         const rank = doc.createElement('span');
@@ -324,10 +329,77 @@ export function createRenderer(doc = document) {
         name.textContent = r.name || 'ななし';
         const score = doc.createElement('span');
         score.className = 's';
-        score.textContent = `${km(r.score)} km`;
+        score.textContent = divisions ? km(r.score) : `${km(r.score)} km`;
         li.append(rank, name, score);
-        els.rankList.append(li);
+        return li;
+      };
+      if (divisions) {
+        const cols = doc.createElement('div');
+        cols.className = 'rank-cols';
+        for (const d of DIVISIONS) {
+          const sec = doc.createElement('section');
+          if (d.key === active) sec.className = 'active';
+          const h = doc.createElement('h3');
+          h.textContent = d.name;
+          const ol = doc.createElement('ol');
+          const top = topN(inDivision(records, d.key), 3);
+          top.forEach((r, i) => ol.append(item(r, i)));
+          if (!top.length) {
+            const li = doc.createElement('li');
+            li.className = 'empty';
+            li.textContent = 'まだ いないよ';
+            ol.append(li);
+          }
+          sec.append(h, ol);
+          cols.append(sec);
+        }
+        els.rankList.append(cols);
+        return;
+      }
+      const ol = doc.createElement('ol');
+      const top = topN(records, 6);
+      if (top.length === 0) {
+        const li = doc.createElement('li');
+        li.className = 'empty';
+        li.textContent = 'まだ だれも とんでいないよ。さいしょの うちゅうひこうしに なろう！';
+        ol.append(li);
+      }
+      top.forEach((r, i) => ol.append(item(r, i)));
+      els.rankList.append(ol);
+    },
+
+    // ---- 順番待ち ----
+    renderQueue(queue) {
+      els.queueList.textContent = '';
+      queue.slice(0, 4).forEach((q, i) => {
+        const li = doc.createElement('li');
+        const no = doc.createElement('span');
+        no.className = 'no';
+        no.textContent = String(i + 1);
+        const nm = doc.createElement('span');
+        nm.textContent = q.name || 'ななし';
+        li.append(no, nm);
+        if (q.division) {
+          const dv = doc.createElement('span');
+          dv.className = 'dv';
+          dv.textContent = `（${divisionName(q.division, true)}）`;
+          li.append(dv);
+        }
+        els.queueList.append(li);
       });
+      if (queue.length > 4) {
+        const li = doc.createElement('li');
+        li.className = 'more';
+        li.textContent = `ほか ${queue.length - 4} にん まってるよ`;
+        els.queueList.append(li);
+      }
+    },
+
+    /** 結果画面の部門ボタン。need = まだ選ばれていなくて選んでほしいとき点滅。 */
+    setDivisionButtons(division, { visible = true, need = false } = {}) {
+      els.divButtons.hidden = !visible;
+      els.divButtons.dataset.need = need ? '1' : '0';
+      for (const b of els.divButtons.querySelectorAll('button')) b.classList.toggle('on', b.dataset.div === division);
     },
 
     // ---- トースト ----

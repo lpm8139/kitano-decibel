@@ -69,6 +69,35 @@ export function altitudeAt(series, t) {
   return series[series.length - 1][1];
 }
 
+/**
+ * 複数の高さの履歴（[[t, km], ...] の配列）を、時刻ごとに平均した履歴を作る（「へいきん」ゴースト用）。
+ * それぞれ、飛び終わったあとは最後の高さのままとして平均する。stepMs ごとに1点。
+ */
+export function averageSeries(list, stepMs = 100) {
+  const xs = (list ?? []).filter((s) => Array.isArray(s) && s.length > 0);
+  if (xs.length === 0) return [];
+  const end = Math.max(...xs.map((s) => s[s.length - 1][0]));
+  const idx = xs.map(() => 0);
+  const out = [];
+  for (let t = 0; ; t += stepMs) {
+    const tt = Math.min(t, end);
+    let sum = 0;
+    xs.forEach((s, k) => {
+      while (idx[k] < s.length - 1 && s[idx[k] + 1][0] <= tt) idx[k] += 1;
+      const i = idx[k];
+      if (i >= s.length - 1 || tt <= s[0][0]) sum += tt <= s[0][0] ? s[0][1] : s[s.length - 1][1];
+      else {
+        const [t0, a0] = s[i];
+        const [t1, a1] = s[i + 1];
+        sum += t1 === t0 ? a1 : a0 + ((a1 - a0) * (tt - t0)) / (t1 - t0);
+      }
+    });
+    out.push([tt, Math.round(sum / xs.length)]);
+    if (tt >= end) break;
+  }
+  return out;
+}
+
 /** ランキング・ゴーストの対象になる記録か（ロケット版・破棄していない・リハーサルでない）。 */
 export function isRankable(r) {
   return Boolean(r && r.game === 'rocket' && !r.deleted && !r.rehearsal && Number.isFinite(r.score));

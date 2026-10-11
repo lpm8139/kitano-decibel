@@ -9,9 +9,10 @@ import * as store from './storage.js';
 import { MicMeter, listAudioInputs } from './audio.js';
 import { createRenderer } from './render.js';
 import { SyncClient, activeRecords, mergeRecords, recordStamp, sameRecords } from './sync.js';
-import { RocketRun, altitudeAt, isRankable, landmarksFor, nextLandmark, reachedLandmark } from './game.js';
+import { RocketRun, altitudeAt, averageSeries, isRankable, landmarksFor, nextLandmark, reachedLandmark } from './game.js';
 import { SoundSystem } from './sound.js';
 import { createAdmin } from './admin.js';
+import { LobbyClient } from './lobby.js';
 
 /** スタンバイ中に反応がなければ待機へ戻るまでの時間（ms）。 */
 const STANDBY_TIMEOUT_MS = 15000;
@@ -27,6 +28,10 @@ const HEALTH_OFFLINE_MS = 5000;
 
 const S = { IDLE: 'idle', STANDBY: 'standby', STAGE1: 'stage1', BOOSTER: 'booster', ENDLESS: 'endless', RESULT: 'result' };
 const RUNNING = new Set([S.STAGE1, S.BOOSTER, S.ENDLESS]);
+
+/** へいきんゴーストに使うには、何人分の記録が要るか。 */
+const AVG_MIN_RECORDS = 3;
+const avgCache = new Map(); // 部門 → 平均の高さの履歴（記録が変わったら作り直す）
 
 const C = { yellow: '#FFD166', cyan: '#8ED6FF', white: '#FFFFFF', green: '#7CF29C', lilac: '#E2A7FF', pink: '#FF7AE0' };
 const fmtKm = (n) => Math.round(n).toLocaleString('ja-JP');
@@ -55,6 +60,12 @@ let initialSynced = false;
 let settingsDirty = false; // 最初の突き合わせ前にこの画面で設定を変えたか（変えていればこちらを優先）
 let lastFrame = performance.now();
 let snapCamera = true;
+let player = null; // いま飛んでいる（スタンバイ中の）人 { name, division, queueId }
+let heldPlayer = null; // 中断で戻ってきた人（次の Space でもう一度）
+let nextDivision = ''; // 受付に登録していない人の部門（待機中に 1/2/3 キーで選ぶ）
+let celebrated = false; // この結果で「しんきろく」の演出をもうしたか
+let phoneInfo = { lan: false, urls: [], key: '' };
+const lobby = new LobbyClient({ onChange: (lb) => onLobbyChange(lb) });
 
 // ---------------------------------------------------------------------------
 // 記録まわり
@@ -63,17 +74,30 @@ let snapCamera = true;
 function setAll(next) {
   allRecords = next;
   records = activeRecords(next).filter(isRankable);
+  avgCache.clear();
+}
+
+/** いま注目している部門（結果画面ならその記録、それ以外は次に飛ぶ人）。 */
+function activeDivision() {
+  if (state === S.RESULT && lastRecord) return lastRecord.division || '';
+  return player?.division || nextPlayer()?.division || '';
 }
 
 function refreshBoard(highlightId = null) {
-  ui.renderRanking(records, highlightId);
+  ui.renderRanking(records, highlightId, { divisions: settings.divisions, active: activeDivision() });
+}
+
+/** 比べる相手のグループ（部門わけがオンで部門が決まっていればその部門、それ以外は全員）。 */
+function groupOf(division) {
+  return settings.divisions && division ? store.inDivision(records, division) : records;
 }
 
 /** ブラウザ内の控え。入りきらなければ、1位以外の履歴を省いた軽い形で残す（本体は PC のファイル）。 */
 function mirrorLocal() {
   if (store.saveRecords(dateKey, allRecords)) return;
-  const best = store.bestRecord(records);
-  const compact = allRecords.map((r) => (best && r.id === best.id ? r : { ...r, series: [], alt: [] }));
+  const keep = new Set(['', ...store.DIVISIONS.map((d) => d.key)].map((d) => store.bestRecord(store.inDivision(records, d))?.id));
+  keep.add(store.bestRecord(records)?.id);
+  const compact = allRecords.map((r) => (keep.has(r.id) ? r : { ...r, series: [], alt: [] }));
   store.saveRecords(dateKey, compact);
 }
 
@@ -81,6 +105,21 @@ function mirrorLocal() {
 function persist(changed) {
   mirrorLocal();
   sync.queueRecords(dateKey, changed);
+}
+
+/** 1件の記録を書き換えて保存（名前・部門）。書き換えた記録を返す。 */
+function updateRecord(id, patch, stamp = Date.now()) {
+  let changed = null;
+  setAll(
+    allRecords.map((r) => {
+      if (r.id !== id) return r;
+      changed = { ...r, ...patch, updatedAt: stamp };
+      return changed;
+    }),
+  );
+  if (changed) persist([changed]);
+  if (lastRecord && lastRecord.id === id && changed) lastRecord = changed;
+  return changed;
 }
 
 /** 日付をまたいだら（深夜0時など）、その日の記録に切り替える。計測中・結果表示中は呼ばない。 */
@@ -97,11 +136,90 @@ function syncDate() {
   }
 }
 
-/** 今日の1位（ゴースト）。高さの履歴を持つ記録だけ。 */
-function ghostRecord() {
-  if (!settings.ghost) return null;
-  const best = store.bestRecord(records);
-  return best && Array.isArray(best.alt) && best.alt.length > 1 ? best : null;
+
+/**
+ * その部門のゴースト（チャンピオン＝1位、へいきん＝みんなの平均の飛び方）。
+ * 部門わけがオフ、または部門が決まっていない人は全員の中で比べる。
+ */
+function ghostsFor(division) {
+  const group = groupOf(division).filter((r) => Array.isArray(r.alt) && r.alt.length > 1);
+  const champ = settings.ghost ? store.bestRecord(group) : null;
+  let avg = null;
+  if (settings.ghostAvg && group.length >= AVG_MIN_RECORDS) {
+    const key = settings.divisions ? division || '*' : '*';
+    if (!avgCache.has(key)) avgCache.set(key, averageSeries(group.map((r) => r.alt)));
+    avg = avgCache.get(key);
+  }
+  return { champ, avg };
+}
+
+// ---------------------------------------------------------------------------
+// 受付（スマホの順番待ち）
+// ---------------------------------------------------------------------------
+
+/** 次に飛ぶ人（中断で戻ってきた人 → 順番待ちの先頭 → 部門だけ選んだ人）。 */
+function nextPlayer() {
+  if (heldPlayer) return heldPlayer;
+  const head = lobby.queue[0];
+  if (head) return { name: head.name || '', division: store.normalizeDivision(head.division), queueId: head.id };
+  if (nextDivision) return { name: '', division: nextDivision, queueId: null };
+  return null;
+}
+
+function playerLabel(p) {
+  if (!p) return '';
+  const dv = settings.divisions && p.division ? `（${store.divisionName(p.division, true)}）` : '';
+  return `${p.name || 'ななし'} さん${dv}`;
+}
+
+/** 待機中の右上（順番待ちがあればリスト、なければあそびかた）と卓の案内。 */
+function renderIdleSide(notice = '') {
+  if (state !== S.IDLE) return;
+  const queue = heldPlayer ? [{ id: 'held', name: heldPlayer.name, division: heldPlayer.division }, ...lobby.queue] : lobby.queue;
+  if (queue.length) {
+    ui.renderQueue(queue);
+    ui.setSide('queue', `じゅんばん まち（${queue.length} にん）`);
+  } else {
+    ui.setSide('howto', 'あそびかた');
+  }
+  if (!micOk) {
+    ui.setStrip(micMessage, 'error');
+    return;
+  }
+  const np = nextPlayer();
+  if (notice) ui.setStrip(notice, 'yellow');
+  else if (np && (np.name || np.division)) ui.setStrip(`つぎは ${playerLabel(np)} の ばん！`, 'green');
+  else ui.setStrip('つぎの うちゅうひこうし、まってるよ！');
+}
+
+/** 結果を受付（スマホ）に見せる形。 */
+function lobbyEntry(r) {
+  return { recordId: r.id, score: r.score, reached: r.reached, name: r.name || '', division: r.division || '', ts: r.ts, updatedAt: r.updatedAt };
+}
+
+/** 受付の内容が変わったとき（スマホで登録・取り消し・後から名前）。 */
+function onLobbyChange(lb) {
+  // スマホで付けた名前・部門を記録に反映（新しい方が勝つ）
+  for (const e of lb.recent) {
+    const rec = allRecords.find((r) => r.id === e.recordId);
+    if (!rec || rec.deleted || !(e.updatedAt > (rec.updatedAt ?? 0))) continue;
+    const name = store.normalizeName(e.name);
+    const division = store.normalizeDivision(e.division);
+    if (name === (rec.name || '') && division === (rec.division || '')) continue;
+    updateRecord(rec.id, { name, division }, e.updatedAt);
+    if (state === S.RESULT && lastRecord?.id === rec.id) {
+      if (ui.els.resultName.value !== name) ui.els.resultName.value = name;
+      showResultRank();
+    } else {
+      refreshBoard();
+    }
+    ui.toast(`スマホから: ${name || 'ななし'}${division ? `（${store.divisionName(division, true)}）` : ''} を とうろく`, 2500);
+  }
+  if (state === S.IDLE) {
+    renderIdleSide();
+    refreshBoard();
+  }
+  admin.setInfo({ queueCount: lb.queue.length });
 }
 
 // ---------------------------------------------------------------------------
@@ -128,20 +246,18 @@ function goIdle(notice = '') {
   run = null;
   ctx = null;
   lastRecord = null;
+  player = null;
   ui.hideResult();
   ui.clearEffects();
   ui.setState(S.IDLE);
-  ui.setSide('howto', 'あそびかた');
   ui.setTitles({ main: 'メインモニター：ロケット', status: 'マイク チェック' });
   ui.setStageTimer(null);
   ui.setEndlessBadge(false);
   ui.world.resetGoals();
-  ui.setGhostOn(Boolean(ghostRecord()));
   snapCamera = true;
   sound.setRunActive(false);
   refreshBoard();
-  if (!micOk) ui.setStrip(micMessage, 'error');
-  else ui.setStrip(notice || 'つぎの うちゅうひこうし、まってるよ！', notice ? 'yellow' : '');
+  renderIdleSide(notice);
 }
 
 function enterStandby() {
@@ -152,31 +268,39 @@ function enterStandby() {
   syncDate();
   ui.hideResult();
   ui.clearEffects();
+  // 次の人を決める（順番待ちから呼んだら、リストから外す）
+  player = nextPlayer() ?? { name: '', division: '', queueId: null };
+  heldPlayer = null;
+  nextDivision = '';
+  if (player.queueId) lobby.remove(player.queueId);
   state = S.STANDBY;
   standbyStart = performance.now();
   run = null;
   ctx = null;
   ui.setState(S.STANDBY);
   ui.setSide('db', 'こえパワー（エンジン出力）');
-  ui.setTitles({ main: 'メインモニター：ロケット', status: 'スタンバイ' });
+  ui.setTitles({ main: player.name ? `メインモニター：${player.name} さん` : 'メインモニター：ロケット', status: 'スタンバイ' });
   ui.world.resetGoals();
-  ui.setGhostOn(Boolean(ghostRecord()));
   snapCamera = true;
   sound.setRunActive(true); // BGM を消す
   sound.se('standby');
-  ui.setStrip('こえを だすと はっしゃ！');
+  ui.setStrip(player.name ? `${player.name} さん、こえを だすと はっしゃ！` : 'こえを だすと はっしゃ！');
+  refreshBoard();
 }
 
 function startRun(now, db) {
-  const ghost = ghostRecord();
+  const ghosts = ghostsFor(player?.division || '');
   run = new RocketRun(settings);
-  ctx = { ghost, clipped: false, lastSampleAt: now, dispAlt: 0, leading: false, wasBehind: false, passed: new Set() };
+  ctx = { ghosts, clipped: false, lastSampleAt: now, dispAlt: 0, leading: false, wasBehind: false, avgLeading: false, avgBehind: false, passed: new Set() };
   state = S.STAGE1;
   ui.setState(S.STAGE1);
-  ui.setGhostOn(Boolean(ghost));
-  ui.world.setGhostName(ghost ? `チャンピオン ${(ghost.name || 'ななし').slice(0, 8)}` : '');
+  const dv = settings.divisions && player?.division ? store.divisionName(player.division, true) : '';
+  ui.world.setGhostNames({
+    champ: ghosts.champ ? `${dv ? `${dv} ` : ''}1い ${(ghosts.champ.name || 'ななし').slice(0, 6)}` : 'チャンピオン',
+    avg: dv ? `${dv} へいきん` : 'みんなの へいきん',
+  });
   ui.setSide('db', 'こえパワー（エンジン出力）');
-  ui.setTitles({ main: 'メインモニター：ロケット', status: 'ミッション じょうきょう' });
+  ui.setTitles({ status: 'ミッション じょうきょう' });
   ui.setStrip('ステージ1：うちゅうへ むかって いるよ！');
   seRun('launch');
   handleEvents(run.start(now, db));
@@ -231,13 +355,53 @@ function handleEvents(events) {
   }
 }
 
+/** 記録がそのグループ（部門）で何位か・しんきろくか。部門わけがオンで部門が未定なら pending。 */
+function rankInfo(rec) {
+  if (!isRankable(rec)) return { rankable: false };
+  if (settings.divisions && !rec.division) return { rankable: true, pending: true };
+  const group = groupOf(rec.division);
+  const others = group.filter((r) => r.id !== rec.id);
+  const prevBest = store.bestRecord(others);
+  return {
+    rankable: true,
+    pending: false,
+    rank: store.rankOf(group, rec.id),
+    isNew: !prevBest || rec.score > prevBest.score,
+  };
+}
+
+/** 結果画面の順位・しんきろく・部門ボタンを、いまの記録の内容で表示し直す。 */
+function showResultRank() {
+  if (state !== S.RESULT || !lastRecord) return;
+  const info = rankInfo(lastRecord);
+  let v;
+  if (!info.rankable) v = 'リハーサル';
+  else if (info.pending) v = 'ぶもんを えらんでね';
+  else v = settings.divisions ? `${store.divisionName(lastRecord.division, true)} ${info.rank} い` : `${info.rank} い`;
+  ui.setCells([
+    { k: 'とどいた たかさ', v: `${fmtKm(lastRecord.score)} km`, color: C.yellow, size: 56 },
+    { k: 'へいきんの こえ', v: Number.isFinite(lastRecord.meanDb) ? `${lastRecord.meanDb.toFixed(1)} dB` : '--', color: C.cyan, size: 50 },
+    { k: 'きょうの じゅんい', v, color: info.isNew ? C.yellow : C.white, size: !info.rankable || info.pending ? 34 : settings.divisions ? 40 : 56 },
+  ]);
+  ui.setDivisionButtons(lastRecord.division || '', { visible: settings.divisions, need: Boolean(info.pending) });
+  if (info.isNew && !celebrated) {
+    celebrated = true;
+    ui.celebrate();
+    ui.setTitles({ main: 'ミッション だいせいこう！！' });
+    ui.setStrip('「しんきろく、かくにん！！」', 'yellow');
+    if (!settings.nameInput) ui.setSide('score', 'しんきろく');
+    sound.se('newRecord');
+  }
+  refreshBoard(lastRecord.id);
+}
+
 function finishRun() {
   const res = run.result();
-  const prevBest = store.bestRecord(records);
   const ts = Date.now();
   const record = {
     id: store.newRecordId(),
-    name: '',
+    name: store.normalizeName(player?.name),
+    division: store.normalizeDivision(player?.division),
     ts,
     updatedAt: ts,
     clipped: ctx.clipped,
@@ -260,12 +424,12 @@ function finishRun() {
   const reached = { ...run.reached };
   setAll([...allRecords, record]);
   persist([record]); // 名前を入れる前に先に保存（途中で閉じても記録が残る）
+  lobby.pushResult(lobbyEntry(record)); // スマホからも名前・部門を付けられるように
   lastRecord = record;
+  celebrated = false;
   run = null;
 
-  const rankable = isRankable(record);
-  const isNewRecord = rankable && (!prevBest || record.score > prevBest.score);
-  const rank = rankable ? store.rankOf(records, record.id) : 0;
+  const info = rankInfo(record);
   const place = reachedLandmark(record.score, landmarksFor(settings));
 
   state = S.RESULT;
@@ -274,43 +438,43 @@ function finishRun() {
   ui.setEndlessBadge(false);
   ui.clearEffects();
   sound.setRunActive(false);
-  sound.se(isNewRecord ? 'newRecord' : 'result');
+  if (!info.isNew) sound.se('result');
   ui.showResult({
     score: record.score,
     place,
     reached,
     boosted: record.boosted,
     beyondMoon: place.km > settings.goal2Km,
-    isNewRecord,
+    isNewRecord: false,
   });
-  ui.setTitles({ main: isNewRecord ? 'ミッション だいせいこう！！' : 'ミッション せいこう！', status: 'けっか' });
-  ui.setCells([
-    { k: 'とどいた たかさ', v: `${fmtKm(record.score)} km`, color: C.yellow, size: 56 },
-    { k: 'へいきんの こえ', v: Number.isFinite(record.meanDb) ? `${record.meanDb.toFixed(1)} dB` : '--', color: C.cyan, size: 50 },
-    { k: 'きょうの じゅんい', v: rankable ? `${rank} い` : 'リハーサル', color: isNewRecord ? C.yellow : C.white, size: rankable ? 56 : 40 },
-  ]);
+  ui.setTitles({ main: 'ミッション せいこう！', status: 'けっか' });
   if (settings.nameInput) {
     ui.setSide('name', 'なまえ にゅうりょく');
-    ui.focusName('');
+    ui.focusName(record.name);
   } else {
-    ui.setSide('score', isNewRecord ? 'しんきろく' : 'けっか');
+    ui.setSide('score', 'けっか');
   }
-  ui.setStrip(isNewRecord ? '「しんきろく、かくにん！！」' : 'ミッション せいこう！ おつかれさま！', isNewRecord ? 'yellow' : 'green');
-  if (isNewRecord) {
-    ui.flash();
-    ui.confetti();
-  }
-  refreshBoard(record.id);
+  ui.setStrip(record.name ? `${record.name} さん、ミッション せいこう！` : 'ミッション せいこう！ おつかれさま！', 'green');
+  showResultRank(); // 順位・しんきろく（部門が決まっていれば）
+}
+
+/** 結果画面で部門を選んだ（PC のボタン・1/2/3 キー）。 */
+function setResultDivision(division) {
+  if (state !== S.RESULT || !lastRecord || !settings.divisions) return;
+  const d = store.normalizeDivision(division);
+  if (d === (lastRecord.division || '')) return;
+  const rec = updateRecord(lastRecord.id, { division: d });
+  if (rec) lobby.pushResult(lobbyEntry(rec));
+  showResultRank();
 }
 
 /** 結果画面を閉じる前に、入力された名前を保存する。 */
 function commitResult() {
   if (!lastRecord) return;
-  const name = settings.nameInput ? store.normalizeName(ui.getResultName()) : '';
-  if (name) {
-    setAll(store.renameRecord(allRecords, lastRecord.id, name));
-    const renamed = allRecords.find((r) => r.id === lastRecord.id);
-    if (renamed) persist([renamed]);
+  const name = settings.nameInput ? store.normalizeName(ui.getResultName()) : lastRecord.name || '';
+  if (name !== (lastRecord.name || '')) {
+    const rec = updateRecord(lastRecord.id, { name });
+    if (rec) lobby.pushResult(lobbyEntry(rec));
     refreshBoard();
   }
   lastRecord = null;
@@ -319,6 +483,8 @@ function commitResult() {
 function abortRun() {
   if (state === S.STANDBY || RUNNING.has(state)) {
     sound.se('abort');
+    // 呼んだ人は順番待ちの先頭に戻す（もう一度 Space で同じ人から）
+    if (player && (player.name || player.division)) heldPlayer = player;
     goIdle(state === S.STANDBY ? '' : 'ちゅうだん しました（きろくは のこりません）');
   }
 }
@@ -422,6 +588,21 @@ const admin = createAdmin(ui.els.admin, {
     else if (!settings.bgm) ui.toast('BGM がオフです（オンにして保存すると流れます）');
     else sound.next();
   },
+  onClearQueue: async () => {
+    const ok = await ui.confirm({
+      title: '順番待ちを全部けす',
+      message: `順番待ち ${lobby.queue.length} 人を全部消します。よろしいですか？`,
+      okLabel: '全部けす',
+    });
+    if (!ok) return;
+    heldPlayer = null;
+    try {
+      await lobby.clear();
+      ui.toast('順番待ちを消しました');
+    } catch {
+      ui.toast('消せませんでした（保存サーバーを確認）');
+    }
+  },
 });
 
 async function requestAdmin() {
@@ -441,6 +622,8 @@ async function requestAdmin() {
     syncText: syncText(),
     recordCount: records.length,
     sounds: sound.files,
+    phone: phoneInfo,
+    queueCount: lobby.queue.length,
   });
   refreshDevices();
   sound.loadPlaylist().then((files) => admin.setInfo({ sounds: files }));
@@ -570,6 +753,21 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.isComposing || e.keyCode === 229) return; // 日本語入力の変換中
 
+  // 部門: 結果画面では 1〜4 でその記録の部門、待機中は次の人（受付していない人）の部門
+  const digit = { Digit1: 'k', Numpad1: 'k', Digit2: 'low', Numpad2: 'low', Digit3: 'high', Numpad3: 'high', Digit4: 'adult', Numpad4: 'adult' }[e.code];
+  if (digit && settings.divisions && state === S.RESULT) {
+    e.preventDefault();
+    setResultDivision(digit);
+    return;
+  }
+  if (digit && settings.divisions && state === S.IDLE && !(e.target instanceof HTMLElement && e.target.matches('input, select, textarea'))) {
+    if (heldPlayer) heldPlayer = { ...heldPlayer, division: digit };
+    else nextDivision = digit;
+    renderIdleSide();
+    refreshBoard();
+    return;
+  }
+
   const nameField = ui.els.resultName;
   if (state === S.RESULT && e.target === nameField) {
     if (e.key === 'Enter') {
@@ -628,6 +826,11 @@ document.addEventListener('click', (e) => {
 
 ui.els.btnAdmin.addEventListener('click', requestAdmin);
 ui.els.btnDiscard.addEventListener('click', discardResult);
+ui.els.divButtons.addEventListener('click', (e) => {
+  const b = e.target instanceof Element ? e.target.closest('button[data-div]') : null;
+  if (b) setResultDivision(b.dataset.div);
+  if (settings.nameInput && state === S.RESULT) ui.els.resultName.focus();
+});
 window.addEventListener('resize', () => ui.fit());
 navigator.mediaDevices?.addEventListener?.('devicechange', () => admin.isOpen() && refreshDevices());
 
@@ -663,21 +866,28 @@ function frame(now) {
   if (run && RUNNING.has(state)) {
     ctx.dispAlt += (run.alt - ctx.dispAlt) * (1 - Math.exp(-dt / 0.08));
     const alt = ctx.dispAlt;
-    const ghostAlt = ctx.ghost ? altitudeAt(ctx.ghost.alt, now - run.t0) : null;
+    const t = now - run.t0;
+    const g = {
+      champ: ctx.ghosts.champ ? altitudeAt(ctx.ghosts.champ.alt, t) : null,
+      avg: ctx.ghosts.avg ? altitudeAt(ctx.ghosts.avg, t) : null,
+    };
     const thrust = currentDb === null ? 0.3 : Math.min(1.6, Math.max(0.25, (currentDb - settings.floor) / 30));
-    ui.world.update({ alt, ghostAlt, thrust, dt, snap: snapCamera });
+    ui.world.update({ alt, ghosts: g, thrust, dt, snap: snapCamera });
     snapCamera = false;
-    trackMoments(alt, ghostAlt);
-    renderRunStatus(now, alt, ghostAlt);
+    trackMoments(alt, g);
+    renderRunStatus(now, alt, g);
   } else if (state === S.IDLE || state === S.STANDBY) {
-    ui.world.update({ alt: 0, ghostAlt: null, thrust: 0.3, dt, snap: snapCamera });
+    ui.world.update({ alt: 0, ghosts: {}, thrust: 0.3, dt, snap: snapCamera });
     snapCamera = false;
     if (state === S.IDLE) {
-      const best = store.bestRecord(records);
+      const np = nextPlayer();
+      const best = store.bestRecord(groupOf(np?.division || ''));
       ui.setCells([
-        { k: 'いまの こえ', v: !micOk || currentDb === null ? '--' : `${currentDb.toFixed(1)} dB`, color: C.cyan, size: 56 },
-        { k: 'もくひょう', v: 'うちゅう・つき', color: C.yellow, size: 40 },
-        best ? { k: 'きょうの チャンピオン', v: `${fmtKm(best.score)} km`, color: C.lilac, size: 44 } : null,
+        { k: 'いまの こえ', v: !micOk || currentDb === null ? '--' : `${currentDb.toFixed(1)} dB`, color: C.cyan, size: 52 },
+        np && (np.name || np.division)
+          ? { k: 'つぎの ひと', v: playerLabel(np).replace(' さん', ''), color: C.yellow, size: 36 }
+          : { k: 'もくひょう', v: 'うちゅう・つき', color: C.yellow, size: 40 },
+        best ? { k: settings.divisions && np?.division ? `${store.divisionName(np.division, true)}の 1い` : 'きょうの 1い', v: `${fmtKm(best.score)} km`, color: C.lilac, size: 44 } : null,
       ]);
     }
   }
@@ -688,16 +898,25 @@ function frame(now) {
   }
 }
 
-/** チャンピオンを抜いた・星を通りすぎた、の演出。 */
-function trackMoments(alt, ghostAlt) {
-  if (ghostAlt !== null) {
-    if (alt < ghostAlt - 3) ctx.wasBehind = true;
-    const leading = alt > ghostAlt + 3;
+/** チャンピオン・へいきんを抜いた、星を通りすぎた、の演出。 */
+function trackMoments(alt, g) {
+  if (g.champ !== null) {
+    if (alt < g.champ - 3) ctx.wasBehind = true;
+    const leading = alt > g.champ + 3;
     if (leading && !ctx.leading && ctx.wasBehind) {
       ui.pop('チャンピオンを ぬいた！', 'lead');
       seRun('pass');
     }
-    if (leading || alt < ghostAlt - 3) ctx.leading = leading;
+    if (leading || alt < g.champ - 3) ctx.leading = leading;
+  }
+  if (g.avg !== null) {
+    if (alt < g.avg - 3) ctx.avgBehind = true;
+    const leading = alt > g.avg + 3;
+    if (leading && !ctx.avgLeading && ctx.avgBehind) {
+      ui.pop('へいきんを ぬいた！');
+      seRun('pass');
+    }
+    if (leading || alt < g.avg - 3) ctx.avgLeading = leading;
   }
   if (state === S.ENDLESS) {
     for (const m of landmarksFor(settings)) {
@@ -710,7 +929,7 @@ function trackMoments(alt, ghostAlt) {
   }
 }
 
-function renderRunStatus(now, alt, ghostAlt) {
+function renderRunStatus(now, alt, g) {
   const marks = landmarksFor(settings);
   if (state === S.STAGE1) {
     const left = run.stageLeft(now) ?? 0;
@@ -734,8 +953,8 @@ function renderRunStatus(now, alt, ghostAlt) {
     const left = Math.max(0, settings.endlessMaxSec - el);
     ui.setStageTimer(left / settings.endlessMaxSec, `のこり ${left.toFixed(1)} びょう`);
     let second;
-    if (ghostAlt !== null && ctx.ghost) {
-      const finalGhost = ctx.ghost.score;
+    if (g.champ !== null && ctx.ghosts.champ) {
+      const finalGhost = ctx.ghosts.champ.score;
       second = alt > finalGhost
         ? { k: 'チャンピオン', v: 'ぬいた！', color: C.yellow, size: 50 }
         : { k: 'チャンピオンまで', v: `あと ${fmtKm(finalGhost - alt)} km`, color: C.lilac, size: 44 };
@@ -808,7 +1027,7 @@ async function pullDay(key) {
     setAll(merged);
     mirrorLocal();
     refreshBoard(state === S.RESULT ? lastRecord?.id : null);
-    if (state === S.IDLE) ui.setGhostOn(Boolean(ghostRecord()));
+    if (state === S.IDLE) renderIdleSide();
   }
   if (!sameRecords(merged, remote)) await sync.queueRecords(key, allRecords);
 }
@@ -841,6 +1060,8 @@ async function initialSync() {
 async function healthLoop() {
   const h = await sync.health();
   if (h) {
+    phoneInfo = { lan: Boolean(h.lan), urls: Array.isArray(h.phoneUrls) ? h.phoneUrls : [], key: h.phoneKey || '' };
+    admin.setInfo({ phone: phoneInfo });
     if (!initialSynced) {
       try {
         await initialSync();
@@ -866,6 +1087,7 @@ goIdle();
 requestAnimationFrame(frame);
 startMic();
 healthLoop();
+lobby.start();
 
 // テスト（tests/e2e_scenarios.py）から状態を読むための窓口。ゲームの動きには関係しない。
 window.__kitano = {
@@ -880,6 +1102,12 @@ window.__kitano = {
   },
   get records() {
     return allRecords;
+  },
+  get lobby() {
+    return lobby.lobby;
+  },
+  get player() {
+    return player;
   },
   get bgm() {
     return { playing: sound.bgmPlaying, files: sound.files, runActive: sound.runActive };

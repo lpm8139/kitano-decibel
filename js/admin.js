@@ -16,7 +16,9 @@ const SCHEMA = [
       sw('nameInput', '名前入力', 'オフ：結果のあと そのまま次の人へ'),
       sw('booster', 'ブースター（月までワープ）', 'オフ：時間内に月に届かなければそこで終了'),
       sw('cheerBoost', 'おうえんメーター', 'ブースター中の会場の声をメーターに表示（記録には入らない）'),
-      sw('ghost', 'ゴースト（今日の1位）'),
+      sw('divisions', '部門わけ', 'ようちえん・1〜3ねん・4〜6ねん・おとな ごとにランキングとゴースト'),
+      sw('ghost', 'チャンピオン ゴースト', '部門（部門わけオフなら全員）の今日の1位'),
+      sw('ghostAvg', 'へいきん ゴースト', '部門のみんなの平均の飛び方（3人そろってから出る）'),
       num('stage1Sec', 'ステージ1の時間', '秒'),
       num('endlessMaxSec', 'エンドレスの最長', '秒'),
       num('silenceEndSec', '声がとぎれたら終了', '秒', 'エンドレス中、開始しきい値未満がこの秒数続いたら終わり', 0.1),
@@ -67,6 +69,8 @@ const SCHEMA2 = [
     title: '運用',
     rows: [
       sw('rehearsal', 'リハーサルモード', 'オン中の記録はランキング・ゴーストに入れない'),
+      { type: 'phone', label: 'スマホ受付' },
+      { type: 'queue', label: '順番待ち' },
       { type: 'pin', key: 'adminPin', label: '暗証番号の変更', note: '4〜8桁の数字。空欄なら変更しない' },
       { type: 'info', label: 'キー操作', html: 'Space スタンバイ/開始 ・ Esc 中断 ・ F 全画面<br>結果画面: Enter 決定 ・ Esc 名前なし ・ Delete 破棄' },
     ],
@@ -108,6 +112,8 @@ export function createAdmin(root, handlers) {
   let soundsEl = null;
   let dataDirEl = null;
   let recordsEl = null;
+  let phoneEl = null;
+  let queueEl = null;
   let open = false;
   let current = null;
 
@@ -177,6 +183,14 @@ export function createAdmin(root, handlers) {
           h('button', { type: 'button', class: 'btn btn-small btn-soft-danger', onclick: () => handlers.onReset?.() }, '本日の記録をリセット'),
         ];
         break;
+      case 'phone':
+        phoneEl = h('div', { class: 'phone-box' });
+        return h('div', { class: 'row', style: 'display:block' },
+          h('div', { class: 'row-label' }, 'スマホ受付（同じ Wi-Fi・PC のテザリングで、QR を読む）'), phoneEl);
+      case 'queue':
+        queueEl = h('span', { class: 'live', style: 'color:#1f2a44' }, '0 人');
+        ctrl = [queueEl, h('button', { type: 'button', class: 'btn btn-small btn-soft-danger', onclick: () => handlers.onClearQueue?.() }, '全部けす')];
+        break;
       case 'pin': {
         const inp = h('input', { type: 'password', inputmode: 'numeric', maxlength: 8, placeholder: '変更しない', autocomplete: 'new-password', 'data-key': 'adminPin' });
         inputs.adminPin = inp;
@@ -209,6 +223,40 @@ export function createAdmin(root, handlers) {
     h('div', { class: 'admin-grid' }, SCHEMA.map(card)),
     h('div', { class: 'admin-grid', style: 'margin-top:20px' }, SCHEMA2.map(card)),
   );
+
+  let phoneKeyShown = '';
+  /** スマホ受付の QR コードと URL。 */
+  function renderPhone(phone) {
+    const sig = JSON.stringify(phone);
+    if (sig === phoneKeyShown) return; // 変わっていなければ作り直さない（毎回 QR を作ると重い）
+    phoneKeyShown = sig;
+    phoneEl.textContent = '';
+    if (!phone || !phone.lan) {
+      phoneEl.append(h('div', { class: 'row-note' },
+        'いまは使えません。Python 版の保存サーバー（start.bat）で起動すると使えます。PowerShell 版は「管理者として実行」したときだけ使えます。'));
+      return;
+    }
+    if (!phone.urls?.length) {
+      phoneEl.append(h('div', { class: 'row-note' }, 'ネットワークにつながっていません。PC の「モバイル ホットスポット」をオンにするか、Wi-Fi につないでください（10秒ほどで出ます）。'));
+      return;
+    }
+    const url = phone.urls[0];
+    const qrBox = h('div', { class: 'phone-qr' });
+    try {
+      const qr = globalThis.qrcode(0, 'M');
+      qr.addData(url);
+      qr.make();
+      qrBox.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+    } catch {
+      qrBox.textContent = '（QR を作れませんでした）';
+    }
+    const list = h('div', { class: 'phone-urls' },
+      h('div', {}, 'スマホのカメラで読む。読めないときは下のアドレスを入力:'),
+      ...phone.urls.map((u) => h('div', { class: 'mono' }, u)),
+      h('div', { style: 'margin-top:6px' }, '合言葉 ', h('b', {}, phone.key || '')),
+      h('div', { class: 'row-note' }, 'スマホは PC と同じネットワークに。PC のテザリングなら 192.168.137.x が先頭に出ます。'));
+    phoneEl.append(qrBox, list);
+  }
 
   function read() {
     const out = {};
@@ -267,7 +315,7 @@ export function createAdmin(root, handlers) {
     },
     read,
     /** 情報欄（デバイス一覧・保存先・記録件数・BGM ファイル）を更新。 */
-    setInfo({ devices, dataDir, syncText, recordCount, sounds } = {}) {
+    setInfo({ devices, dataDir, syncText, recordCount, sounds, phone, queueCount } = {}) {
       if (devices && deviceSel) {
         const selected = current?.deviceId ?? '';
         deviceSel.textContent = '';
@@ -279,6 +327,8 @@ export function createAdmin(root, handlers) {
         dataDirEl.textContent = `${dataDir || '（保存サーバー未接続）'}${syncText ? `　${syncText}` : ''}`;
       }
       if (recordsEl && recordCount !== undefined) recordsEl.textContent = `${recordCount} 件`;
+      if (queueEl && queueCount !== undefined) queueEl.textContent = `${queueCount} 人`;
+      if (phoneEl && phone !== undefined) renderPhone(phone);
       if (soundsEl && sounds !== undefined) {
         soundsEl.textContent = sounds.length
           ? sounds.join(' ／ ')

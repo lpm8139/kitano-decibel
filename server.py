@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-server.py — 声の大きさ競争 の保存サーバー（Python 標準ライブラリのみ）
+server.py — ロケット かんせいしつ の保存サーバー（Python 標準ライブラリのみ）
 
 役割
   1. アプリ（index.html / js / css）を http://localhost:<port>/ で配信する
@@ -25,8 +25,15 @@ API（server.ps1 と完全に同じ）
   GET  /api/settings              → 設定（無ければ null）
   GET  /api/sounds                → sound フォルダの音楽ファイル名 {"files":[...]}（BGM 用）
   POST /api/settings              → 設定を保存
+  GET  /api/lobby                 → 受付（順番待ち queue・最近の結果 recent）
+  POST /api/lobby                 → 受付の操作 {"op":"add"|"remove"|"edit"|"result"|"clear", ...}
 
-テスト用オプション: --port N（固定）/ --data-dir PATH / --no-browser
+スマホ受付（同じネットワーク。PC のテザリングなど）
+  待ち受けは 0.0.0.0（LAN）と ::1。ただし PC 以外（LAN）からは
+  受付ページ /phone.html と、合言葉（data/phone-key.txt）付きの /api/lobby だけ許可する。
+  記録・設定・アプリ本体は PC（localhost）からしか見えない。
+
+テスト用オプション: --port N（固定）/ --data-dir PATH / --no-browser / --local-only（LAN に公開しない）
 """
 
 import argparse
@@ -35,11 +42,13 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -175,6 +184,134 @@ def save_records(data_dir, date, incoming):
 
 
 # ---------------------------------------------------------------------------
+# 受付（スマホで名前と部門を登録 → PC の順番待ちに出る。飛んだあとの名前もスマホから入れられる）
+# ---------------------------------------------------------------------------
+
+DIVISIONS = ("", "k", "low", "high", "adult")  # なし / ようちえん / 1〜3ねん / 4〜6ねん / おとな
+QUEUE_MAX = 60
+RECENT_MAX = 8
+NAME_MAX = 20
+_lobby_lock = threading.Lock()
+_lobby = None  # data/lobby.json の中身（メモリに持つ）
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+def _clean_name(v):
+    return str(v if v is not None else "").strip()[:NAME_MAX]
+
+
+def _clean_div(v):
+    return v if v in DIVISIONS else ""
+
+
+def load_lobby(data_dir):
+    global _lobby
+    if _lobby is None:
+        d = read_json(os.path.join(data_dir, "lobby.json"), None)
+        if not isinstance(d, dict):
+            d = {}
+        q = d.get("queue") if isinstance(d.get("queue"), list) else []
+        r = d.get("recent") if isinstance(d.get("recent"), list) else []
+        _lobby = {"rev": int(d.get("rev") or 0) if isinstance(d.get("rev"), (int, float)) else 0,
+                  "queue": [x for x in q if isinstance(x, dict) and isinstance(x.get("id"), str)],
+                  "recent": [x for x in r if isinstance(x, dict) and isinstance(x.get("recordId"), str)]}
+    return _lobby
+
+
+def lobby_op(data_dir, body, local):
+    """受付の操作。成功したら (lobby, None)、だめなら (None, (status, message))。"""
+    if not isinstance(body, dict):
+        return None, (HTTPStatus.BAD_REQUEST, "lobby op must be an object")
+    op = body.get("op")
+    with _lobby_lock:
+        lb = load_lobby(data_dir)
+        if op == "add":
+            name, div = _clean_name(body.get("name")), _clean_div(body.get("division"))
+            if not name and not div:
+                return None, (HTTPStatus.BAD_REQUEST, "name or division required")
+            if len(lb["queue"]) >= QUEUE_MAX:
+                return None, (HTTPStatus.CONFLICT, "queue is full")
+            lb["queue"].append({"id": secrets.token_hex(6), "name": name, "division": div, "ts": _now_ms()})
+        elif op == "remove":
+            before = len(lb["queue"])
+            lb["queue"] = [x for x in lb["queue"] if x.get("id") != body.get("id")]
+            if len(lb["queue"]) == before:
+                return lb, None  # もう無い（別の画面が先に呼んだ）→ そのまま返す
+        elif op == "edit":
+            rid = body.get("recordId")
+            hit = [x for x in lb["recent"] if x.get("recordId") == rid]
+            if not hit:
+                return None, (HTTPStatus.NOT_FOUND, "record not in recent")
+            hit[0]["name"] = _clean_name(body.get("name"))
+            hit[0]["division"] = _clean_div(body.get("division"))
+            hit[0]["updatedAt"] = _now_ms()
+        elif op == "result" and local:
+            e = body.get("entry")
+            if not isinstance(e, dict) or not isinstance(e.get("recordId"), str):
+                return None, (HTTPStatus.BAD_REQUEST, "entry.recordId required")
+            entry = {"recordId": e["recordId"], "score": e.get("score"), "reached": str(e.get("reached") or ""),
+                     "name": _clean_name(e.get("name")), "division": _clean_div(e.get("division")),
+                     "ts": e.get("ts") if isinstance(e.get("ts"), (int, float)) else _now_ms(),
+                     "updatedAt": e.get("updatedAt") if isinstance(e.get("updatedAt"), (int, float)) else _now_ms()}
+            lb["recent"] = [x for x in lb["recent"] if x.get("recordId") != entry["recordId"]] + [entry]
+            lb["recent"] = sorted(lb["recent"], key=lambda x: x.get("ts") or 0)[-RECENT_MAX:]
+        elif op == "clear" and local:
+            lb["queue"] = []
+        elif op in ("result", "clear"):
+            return None, (HTTPStatus.FORBIDDEN, "PC only")
+        else:
+            return None, (HTTPStatus.BAD_REQUEST, "unknown op")
+        lb["rev"] += 1
+        atomic_write_json(os.path.join(data_dir, "lobby.json"), lb)
+        return lb, None
+
+
+def phone_key(data_dir):
+    """スマホ受付の合言葉（data/phone-key.txt。無ければ作る）。"""
+    path = os.path.join(data_dir, "phone-key.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            k = f.read().strip()
+            if re.match(r"^[a-z0-9]{6,32}$", k):
+                return k
+    except OSError:
+        pass
+    k = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(8))
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(k)
+    except OSError:
+        pass
+    return k
+
+
+def lan_addresses():
+    """この PC の LAN の IPv4 アドレス（テザリングの 192.168.137.1 を先頭に）。"""
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))  # 実際には送信しない（経路の確認だけ）
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    ips = [ip for ip in ips if not ip.startswith(("127.", "169.254.", "0."))]
+    return sorted(ips, key=lambda ip: (not ip.startswith("192.168.137."), ip))
+
+
+def is_local_client(addr):
+    return addr in ("::1", "localhost") or addr.startswith("127.") or addr.startswith("::ffff:127.")
+
+
+# ---------------------------------------------------------------------------
 # BGM（sound フォルダ）
 # ---------------------------------------------------------------------------
 
@@ -197,9 +334,36 @@ def list_sounds():
 # HTTP
 # ---------------------------------------------------------------------------
 
+PHONE_PAGES = ("/phone.html", "/phone")
+
+
 class Handler(SimpleHTTPRequestHandler):
     data_dir = None
     port = None
+    lan = False
+
+    def _local(self):
+        return is_local_client(self.client_address[0])
+
+    def _key_ok(self):
+        q = self.path.split("?", 1)[1] if "?" in self.path else ""
+        sent = self.headers.get("X-Kitano-Key") or ""
+        for part in q.split("&"):
+            if part.startswith("k="):
+                sent = sent or part[2:]
+        return bool(sent) and secrets.compare_digest(sent, phone_key(self.data_dir))
+
+    def _gate(self, name):
+        """PC 以外（LAN）からは、受付ページと合言葉付きの受付 API だけ通す。通さないときは応答を返して False。"""
+        if self._local():
+            return True
+        path = self.path.split("?", 1)[0]
+        if name is None and path in PHONE_PAGES:
+            return True
+        if name == "lobby" and self._key_ok():
+            return True
+        self._error(HTTPStatus.FORBIDDEN, "forbidden")
+        return False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=ROOT, **kwargs)
@@ -247,13 +411,24 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         name, rest = self._route()
+        if not self._gate(name):
+            return None
         if name is None:
-            if self.path.split("?", 1)[0].startswith("/data/"):
+            path = self.path.split("?", 1)[0]
+            if path.startswith("/data/"):
                 return self._error(HTTPStatus.NOT_FOUND, "not found")
+            if path == "/phone":
+                self.path = "/phone.html"
             return super().do_GET()
         try:
             if name == "health" and not rest:
-                return self._send_json({"ok": True, "server": "python", "dataDir": self.data_dir, "port": self.port})
+                key = phone_key(self.data_dir)
+                urls = ["http://%s:%d/phone.html?k=%s" % (ip, self.port, key) for ip in lan_addresses()] if self.lan else []
+                return self._send_json({"ok": True, "server": "python", "dataDir": self.data_dir, "port": self.port,
+                                        "lan": self.lan, "phoneKey": key, "phoneUrls": urls})
+            if name == "lobby" and not rest:
+                with _lobby_lock:
+                    return self._send_json(load_lobby(self.data_dir))
             if name == "records" and len(rest) == 1 and DATE_RE.match(rest[0]):
                 data = read_json(os.path.join(self.data_dir, "%s.json" % rest[0]), [])
                 return self._send_json(data if isinstance(data, list) else [])
@@ -268,9 +443,16 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):
         raw = self._read_raw()
         name, rest = self._route()
+        if not self._gate(name):
+            return None
         if name is None:
             return self._error(HTTPStatus.NOT_FOUND, "not found")
         try:
+            if name == "lobby" and not rest:
+                lb, err = lobby_op(self.data_dir, self._parse(raw), self._local())
+                if err:
+                    return self._error(*err)
+                return self._send_json(lb)
             if name == "records" and len(rest) == 1 and DATE_RE.match(rest[0]):
                 body = self._parse(raw)
                 if not isinstance(body, list) or not all(isinstance(r, dict) and isinstance(r.get("id"), str) for r in body):
@@ -358,17 +540,25 @@ def _ipv6_available():
         return False
 
 
-def bind_server(ports):
-    """127.0.0.1 と ::1 の両方で待ち受ける。
+def bind_server(ports, lan=True):
+    """IPv4 と ::1 の両方で待ち受ける。
     ブラウザや Windows は「localhost」をまず IPv6(::1) で試すため、IPv4 だけだと
-    接続のたびに約2秒待たされる（Windows 実機で確認）。どちらも外部には公開しない。"""
+    接続のたびに約2秒待たされる（Windows 実機で確認）。
+    lan=True なら IPv4 は 0.0.0.0（スマホ受付用。PC 以外からは受付だけ許可）、False なら 127.0.0.1 だけ。
+    戻り値: (サーバーのリスト, ポート, LAN に公開できたか)"""
     v6 = _ipv6_available()
     last = None
     for p in ports:
-        try:
-            s4 = LocalHTTPServer(("127.0.0.1", p), Handler)
-        except OSError as e:
-            last = e
+        s4 = None
+        on_lan = False
+        for host in (("0.0.0.0", "127.0.0.1") if lan else ("127.0.0.1",)):
+            try:
+                s4 = LocalHTTPServer((host, p), Handler)
+                on_lan = host == "0.0.0.0"
+                break
+            except OSError as e:
+                last = e
+        if s4 is None:
             continue
         s6 = None
         if v6:
@@ -378,7 +568,7 @@ def bind_server(ports):
                 s4.server_close()  # ::1 側を別アプリが使っている → ブラウザがそちらに繋がるので避ける
                 last = e
                 continue
-        return [s for s in (s4, s6) if s], p
+        return [s for s in (s4, s6) if s], p, on_lan
     raise SystemExit("[NG] ポート %d〜%d がすべて使用中です（%s）。他のサーバーを閉じてから再実行してください。" % (ports[0], ports[-1], last))
 
 
@@ -414,6 +604,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int)
     ap.add_argument("--data-dir")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--local-only", action="store_true")
     args = ap.parse_args(argv)
 
     lines = ["===== 環境チェック %s =====" % _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -422,10 +613,16 @@ def main(argv=None):
     lines += notes
     lines.append("[OK] 保存先: %s" % data_dir)
 
-    servers, port = bind_server([args.port] if args.port else PORT_CANDIDATES)
+    servers, port, on_lan = bind_server([args.port] if args.port else PORT_CANDIDATES, lan=not args.local_only)
     if port != PORT_CANDIDATES[0] and not args.port:
         lines.append("[注意] ポート 8000 が使用中のため %d を使います（記録はファイルから復元されるので問題ありません）" % port)
     lines.append("[OK] アドレス: http://localhost:%d/" % port)
+    if on_lan:
+        ips = lan_addresses()
+        lines.append("[OK] スマホ受付: 管理者画面の QR コードから（%s）" % (", ".join("%s:%d" % (ip, port) for ip in ips) or "ネットワーク未接続。テザリングをオンにすると使えます"))
+        lines.append("     ※ Windows のファイアウォールの確認が出たら「アクセスを許可する」を押してください")
+    else:
+        lines.append("[注意] スマホ受付は使えません（LAN に公開できませんでした）。PC だけで遊べます")
 
     exe, label = find_browser()
     if not args.no_browser:
@@ -433,6 +630,8 @@ def main(argv=None):
 
     Handler.data_dir = data_dir
     Handler.port = port
+    Handler.lan = on_lan
+    phone_key(data_dir)
     for ln in lines:
         print(ln)
     try:
