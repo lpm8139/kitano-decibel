@@ -254,6 +254,32 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(lb["queue"], [])
         self.assertEqual(self.read_file("lobby.json")["rev"], lb["rev"])
 
+    def test_lobby_status_and_commands(self):
+        """スマホからの操作: PC の様子（status）・暗証番号の確認・操作の受け渡し（PC だけに見える）"""
+        self.assertEqual(req(self.base, "/api/settings", {"adminPin": "2468", "offset": 100})[0], 200)
+        st, lb = req(self.base, "/api/lobby", {"op": "status", "status": {"state": "idle", "db": 61.2}})
+        self.assertEqual(st, 200)
+        self.assertEqual(lb["status"]["state"], "idle")
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "status", "status": "x"})[0], 400)
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "auth", "pin": "0000"})[0], 403)
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "auth", "pin": "2468"})[0], 200)
+        seq0 = req(self.base, "/api/lobby")[1]["cmdSeq"]
+        st, lb = req(self.base, "/api/lobby", {"op": "command", "cmd": "standby"})
+        self.assertEqual((st, lb["cmdSeq"]), (200, seq0 + 1))
+        self.assertEqual(lb["commands"][-1]["cmd"], "standby")
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "command", "cmd": "explode"})[0], 400)
+        self.assertEqual(req(self.base, "/api/lobby", {"op": "command", "cmd": "settings", "pin": "1111", "settings": {"kmRate": 9}})[0], 403)
+        st, lb = req(self.base, "/api/lobby", {"op": "command", "cmd": "settings", "pin": "2468",
+                                               "settings": {"kmRate": 9, "adminPin": "9999", "deviceId": "x"}})
+        self.assertEqual(st, 200)
+        self.assertEqual(lb["commands"][-1]["settings"], {"kmRate": 9})  # 暗証番号・マイクはスマホから変えない
+        for i in range(25):
+            req(self.base, "/api/lobby", {"op": "command", "cmd": "abort"})
+        lb = req(self.base, "/api/lobby")[1]
+        self.assertEqual(len(lb["commands"]), 20)
+        self.assertEqual(lb["commands"][-1]["seq"], lb["cmdSeq"])
+        req(self.base, "/api/settings", {"offset": 100})  # 他のテストのために戻す
+
     def test_lan_only_phone(self):
         """PC 以外（LAN）からは、受付ページと合言葉付きの受付 API だけ。記録・設定・アプリ本体は見えない"""
         h = req(self.base, "/api/health")[1]
@@ -288,6 +314,12 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(code("/api/lobby?k=" + key, {"op": "clear"})[0], 403)  # 全消去と結果の追加は PC だけ
         self.assertEqual(code("/api/lobby?k=" + key, {"op": "result", "entry": {"recordId": "z"}})[0], 403)
         self.assertIn("スマホ", [x["name"] for x in req(self.base, "/api/lobby")[1]["queue"]])
+        # スマホから: 操作は送れるが、操作の一覧は見えない。PC の様子は書けない
+        st, body = code("/api/lobby?k=" + key, {"op": "command", "cmd": "standby"})
+        self.assertEqual(st, 200)
+        self.assertNotIn("commands", json.loads(body))
+        self.assertIn("status", json.loads(body))
+        self.assertEqual(code("/api/lobby?k=" + key, {"op": "status", "status": {"state": "x"}})[0], 403)
 
     def test_persists_across_restart(self):
         d = "2026-10-06"

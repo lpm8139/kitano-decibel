@@ -37,6 +37,13 @@ const C = { yellow: '#FFD166', cyan: '#8ED6FF', white: '#FFFFFF', green: '#7CF29
 const fmtKm = (n) => Math.round(n).toLocaleString('ja-JP');
 
 const ui = createRenderer(document);
+{
+  const setState = ui.setState;
+  ui.setState = (st) => {
+    setState(st);
+    pushStatusSoon(); // スマホにすぐ知らせる
+  };
+}
 const sound = new SoundSystem();
 
 let settings = store.loadSettings();
@@ -64,8 +71,9 @@ let player = null; // いま飛んでいる（スタンバイ中の）人 { name
 let heldPlayer = null; // 中断で戻ってきた人（次の Space でもう一度）
 let nextDivision = ''; // 受付に登録していない人の部門（待機中に 1/2/3 キーで選ぶ）
 let celebrated = false; // この結果で「しんきろく」の演出をもうしたか
+let askName = false; // この結果で名前を聞いているか（名前入力オフ・スマホで登録済みなら聞かない）
 let phoneInfo = { lan: false, urls: [], key: '' };
-const lobby = new LobbyClient({ onChange: (lb) => onLobbyChange(lb) });
+const lobby = new LobbyClient({ onChange: (lb) => onLobbyChange(lb), onCommands: (cmds) => cmds.forEach(onRemoteCommand) });
 
 // ---------------------------------------------------------------------------
 // 記録まわり
@@ -237,6 +245,91 @@ function applyLook() {
 const placeName = (key) => landmarksFor(settings).find((m) => m.key === key)?.name ?? '';
 
 // ---------------------------------------------------------------------------
+// スマホからの操作（スタンバイ・スタート・中断・結果を閉じる・設定）と、スマホに見せる PC の様子
+// ---------------------------------------------------------------------------
+
+/** スマホの操作は、送ってから時間がたったものは実行しない（PC が止まっていて、あとからまとめて届いたとき用）。 */
+const REMOTE_MAX_AGE_MS = 15000;
+/** スマホにも見せてよい設定（暗証番号・マイクの選択は見せない・変えさせない）。 */
+const REMOTE_SETTING_KEYS = Object.keys(store.DEFAULT_SETTINGS).filter((k) => k !== 'adminPin' && k !== 'deviceId');
+
+function remoteStatus() {
+  const np = nextPlayer();
+  const cur = state === S.RESULT ? lastRecord : null;
+  return {
+    state,
+    player: player ? { name: player.name || '', division: player.division || '' } : null,
+    next: np ? { name: np.name || '', division: np.division || '' } : null,
+    result: cur ? { id: cur.id, score: cur.score, name: cur.name || '', division: cur.division || '', reached: cur.reached } : null,
+    db: currentDb === null ? null : Math.round(currentDb * 10) / 10,
+    micOk,
+    busy: admin.isOpen() || ui.isModalOpen(), // PC で管理者画面・確認を開いている間は操作できない
+    settings: Object.fromEntries(REMOTE_SETTING_KEYS.map((k) => [k, settings[k]])),
+  };
+}
+
+let statusTimer = null;
+function pushStatusSoon() {
+  clearTimeout(statusTimer);
+  statusTimer = setTimeout(() => lobby.pushStatus(remoteStatus()), 50);
+}
+
+function onRemoteCommand(c) {
+  if (!c || Date.now() - (c.ts ?? 0) > REMOTE_MAX_AGE_MS) return;
+  if (c.cmd === 'settings') {
+    applyRemoteSettings(c.settings);
+    return;
+  }
+  if (admin.isOpen() || ui.isModalOpen()) {
+    ui.toast('スマホの操作: PC で管理者画面などを開いているので、閉じてからもう一度');
+    return;
+  }
+  sound.unlock();
+  mic.resume();
+  switch (c.cmd) {
+    case 'standby':
+      if (state === S.IDLE) enterStandby();
+      else if (state === S.RESULT) {
+        commitResult();
+        enterStandby();
+      }
+      break;
+    case 'start':
+      // スタンバイ中だけ。スマホの表示が古くて待機中に届いたときは、まずスタンバイにする（いきなり飛ばない）
+      if (state === S.STANDBY) startRun(performance.now(), currentDb ?? settings.threshold);
+      else if (state === S.IDLE) enterStandby();
+      break;
+    case 'abort':
+      abortRun();
+      break;
+    case 'close':
+      if (state === S.RESULT) backToIdleFromResult();
+      break;
+    default:
+      break;
+  }
+  pushStatusSoon();
+}
+
+/** スマホの管理者画面から来た設定（暗証番号はサーバーで確認済み）。飛んでいる最中の回には影響しない。 */
+function applyRemoteSettings(patch) {
+  if (!patch || typeof patch !== 'object') return;
+  const allowed = Object.fromEntries(Object.entries(patch).filter(([k]) => REMOTE_SETTING_KEYS.includes(k)));
+  const next = store.normalizeSettings({ ...settings, ...allowed, adminPin: settings.adminPin, deviceId: settings.deviceId });
+  if (JSON.stringify(next) === JSON.stringify(settings)) return;
+  settings = next;
+  if (!initialSynced) settingsDirty = true;
+  store.saveSettings(settings);
+  sync.queueSettings(settings);
+  applyLook();
+  if (admin.isOpen()) admin.open(settings); // PC で開いていれば表示をそろえる
+  if (state === S.IDLE) goIdle();
+  else refreshBoard(state === S.RESULT ? lastRecord?.id : null);
+  ui.toast('スマホから設定を変更しました');
+  pushStatusSoon();
+}
+
+// ---------------------------------------------------------------------------
 // 状態遷移
 // ---------------------------------------------------------------------------
 
@@ -253,6 +346,7 @@ function goIdle(notice = '') {
   ui.setTitles({ main: 'メインモニター：ロケット', status: 'マイク チェック' });
   ui.setStageTimer(null);
   ui.setEndlessBadge(false);
+  ui.setSpeed(null);
   ui.world.resetGoals();
   snapCamera = true;
   sound.setRunActive(false);
@@ -291,7 +385,7 @@ function enterStandby() {
 function startRun(now, db) {
   const ghosts = ghostsFor(player?.division || '');
   run = new RocketRun(settings);
-  ctx = { ghosts, clipped: false, lastSampleAt: now, dispAlt: 0, leading: false, wasBehind: false, avgLeading: false, avgBehind: false, passed: new Set() };
+  ctx = { ghosts, clipped: false, lastSampleAt: now, dispAlt: 0, speed: 0, leading: false, wasBehind: false, avgLeading: false, avgBehind: false, passed: new Set() };
   state = S.STAGE1;
   ui.setState(S.STAGE1);
   const dv = settings.divisions && player?.division ? store.divisionName(player.division, true) : '';
@@ -375,13 +469,17 @@ function showResultRank() {
   if (state !== S.RESULT || !lastRecord) return;
   const info = rankInfo(lastRecord);
   let v;
+  let k = 'きょうの じゅんい';
   if (!info.rankable) v = 'リハーサル';
-  else if (info.pending) v = 'ぶもんを えらんでね';
-  else v = settings.divisions ? `${store.divisionName(lastRecord.division, true)} ${info.rank} い` : `${info.rank} い`;
+  else if (info.pending) v = 'ぶもんは？';
+  else {
+    v = `${info.rank} い`;
+    if (settings.divisions) k = `${store.divisionName(lastRecord.division, true)}の じゅんい`;
+  }
   ui.setCells([
     { k: 'とどいた たかさ', v: `${fmtKm(lastRecord.score)} km`, color: C.yellow, size: 56 },
     { k: 'へいきんの こえ', v: Number.isFinite(lastRecord.meanDb) ? `${lastRecord.meanDb.toFixed(1)} dB` : '--', color: C.cyan, size: 50 },
-    { k: 'きょうの じゅんい', v, color: info.isNew ? C.yellow : C.white, size: !info.rankable || info.pending ? 34 : settings.divisions ? 40 : 56 },
+    { k, v, color: info.isNew ? C.yellow : C.white, size: !info.rankable || info.pending ? 40 : 56 },
   ]);
   ui.setDivisionButtons(lastRecord.division || '', { visible: settings.divisions, need: Boolean(info.pending) });
   if (info.isNew && !celebrated) {
@@ -389,7 +487,7 @@ function showResultRank() {
     ui.celebrate();
     ui.setTitles({ main: 'ミッション だいせいこう！！' });
     ui.setStrip('「しんきろく、かくにん！！」', 'yellow');
-    if (!settings.nameInput) ui.setSide('score', 'しんきろく');
+    if (!askName) ui.setSide('score', lastRecord.name ? `${lastRecord.name} さん しんきろく！` : 'しんきろく');
     sound.se('newRecord');
   }
   refreshBoard(lastRecord.id);
@@ -436,6 +534,7 @@ function finishRun() {
   ui.setState(S.RESULT);
   ui.setStageTimer(null);
   ui.setEndlessBadge(false);
+  ui.setSpeed(null);
   ui.clearEffects();
   sound.setRunActive(false);
   if (!info.isNew) sound.se('result');
@@ -448,11 +547,13 @@ function finishRun() {
     isNewRecord: false,
   });
   ui.setTitles({ main: 'ミッション せいこう！', status: 'けっか' });
-  if (settings.nameInput) {
+  // 名前を聞くのは、名前入力がオンで、まだ名前が無いとき（スマホ受付で登録済みならとばす）
+  askName = settings.nameInput && !record.name;
+  if (askName) {
     ui.setSide('name', 'なまえ にゅうりょく');
     ui.focusName(record.name);
   } else {
-    ui.setSide('score', 'けっか');
+    ui.setSide('score', record.name ? `${record.name} さんの けっか` : 'けっか');
   }
   ui.setStrip(record.name ? `${record.name} さん、ミッション せいこう！` : 'ミッション せいこう！ おつかれさま！', 'green');
   showResultRank(); // 順位・しんきろく（部門が決まっていれば）
@@ -471,7 +572,7 @@ function setResultDivision(division) {
 /** 結果画面を閉じる前に、入力された名前を保存する。 */
 function commitResult() {
   if (!lastRecord) return;
-  const name = settings.nameInput ? store.normalizeName(ui.getResultName()) : lastRecord.name || '';
+  const name = askName ? store.normalizeName(ui.getResultName()) : lastRecord.name || '';
   if (name !== (lastRecord.name || '')) {
     const rec = updateRecord(lastRecord.id, { name });
     if (rec) lobby.pushResult(lobbyEntry(rec));
@@ -498,7 +599,7 @@ async function discardResult() {
     okLabel: '破棄する',
   });
   if (!ok) {
-    if (settings.nameInput) ui.els.resultName.focus();
+    if (askName) ui.els.resultName.focus();
     return;
   }
   setAll(store.markDeleted(allRecords, id));
@@ -829,7 +930,7 @@ ui.els.btnDiscard.addEventListener('click', discardResult);
 ui.els.divButtons.addEventListener('click', (e) => {
   const b = e.target instanceof Element ? e.target.closest('button[data-div]') : null;
   if (b) setResultDivision(b.dataset.div);
-  if (settings.nameInput && state === S.RESULT) ui.els.resultName.focus();
+  if (askName && state === S.RESULT) ui.els.resultName.focus();
 });
 window.addEventListener('resize', () => ui.fit());
 navigator.mediaDevices?.addEventListener?.('devicechange', () => admin.isOpen() && refreshDevices());
@@ -864,7 +965,11 @@ function frame(now) {
   }
 
   if (run && RUNNING.has(state)) {
+    const before = ctx.dispAlt;
     ctx.dispAlt += (run.alt - ctx.dispAlt) * (1 - Math.exp(-dt / 0.08));
+    // いきおい（km/秒）。表示がちらつかないよう少しならす
+    if (dt > 0) ctx.speed += ((ctx.dispAlt - before) / dt - ctx.speed) * Math.min(1, dt / 0.3);
+    ui.setSpeed(ctx.speed);
     const alt = ctx.dispAlt;
     const t = now - run.t0;
     const g = {
@@ -872,7 +977,7 @@ function frame(now) {
       avg: ctx.ghosts.avg ? altitudeAt(ctx.ghosts.avg, t) : null,
     };
     const thrust = currentDb === null ? 0.3 : Math.min(1.6, Math.max(0.25, (currentDb - settings.floor) / 30));
-    ui.world.update({ alt, ghosts: g, thrust, dt, snap: snapCamera });
+    ui.world.update({ alt, ghosts: g, thrust, dt, snap: snapCamera, boosting: state === S.BOOSTER });
     snapCamera = false;
     trackMoments(alt, g);
     renderRunStatus(now, alt, g);
@@ -1088,6 +1193,7 @@ requestAnimationFrame(frame);
 startMic();
 healthLoop();
 lobby.start();
+setInterval(() => lobby.pushStatus(remoteStatus()), 1000); // スマホの「いまの こえ」なども 1 秒ごとに
 
 // テスト（tests/e2e_scenarios.py）から状態を読むための窓口。ゲームの動きには関係しない。
 window.__kitano = {

@@ -26,7 +26,9 @@ API（server.ps1 と完全に同じ）
   GET  /api/sounds                → sound フォルダの音楽ファイル名 {"files":[...]}（BGM 用）
   POST /api/settings              → 設定を保存
   GET  /api/lobby                 → 受付（順番待ち queue・最近の結果 recent）
-  POST /api/lobby                 → 受付の操作 {"op":"add"|"remove"|"edit"|"result"|"clear", ...}
+  POST /api/lobby                 → 受付の操作 {"op":"add"|"remove"|"edit"|"result"|"clear"|"status"|"auth"|"command", ...}
+                                    status = PC のいまの様子（スマホに見せる）／ command = スマホからの操作
+                                    （standby・start・abort・close、settings は暗証番号つき）。PC が取りに来て実行する
 
 スマホ受付（同じネットワーク。PC のテザリングなど）
   待ち受けは 0.0.0.0（LAN）と ::1。ただし PC 以外（LAN）からは
@@ -221,11 +223,70 @@ def load_lobby(data_dir):
     return _lobby
 
 
+# スマホからの操作（PC が 1 秒ごとに取りに来て実行する）と、PC のいまの様子（スマホに見せる）。メモリだけに持つ。
+COMMANDS = ("standby", "start", "abort", "close", "settings")
+COMMAND_KEEP = 20
+_live = {"status": None, "statusAt": 0, "seq": 0, "commands": [], "boot": secrets.token_hex(4)}  # boot = サーバーを起動するたびに変わる
+PIN_RE = re.compile(r"^\d{4,8}$")
+
+
+def admin_pin(data_dir):
+    """管理者の暗証番号（data/settings.json。無ければ 0000）。"""
+    st = read_json(os.path.join(data_dir, "settings.json"), None)
+    pin = st.get("adminPin") if isinstance(st, dict) else None
+    return pin if isinstance(pin, str) and PIN_RE.match(pin) else "0000"
+
+
+def lobby_view(lb, local):
+    """受付の中身＋PC の様子。操作の一覧は PC にだけ渡す。"""
+    v = {"rev": lb["rev"], "queue": lb["queue"], "recent": lb["recent"],
+         "status": _live["status"], "statusAt": _live["statusAt"], "cmdSeq": _live["seq"], "boot": _live["boot"]}
+    if local:
+        v["commands"] = _live["commands"]
+    return v
+
+
+def _pin_ok(data_dir, pin):
+    return isinstance(pin, str) and secrets.compare_digest(pin, admin_pin(data_dir))
+
+
 def lobby_op(data_dir, body, local):
-    """受付の操作。成功したら (lobby, None)、だめなら (None, (status, message))。"""
+    """受付の操作。成功したら (lobby の見え方, None)、だめなら (None, (status, message))。"""
     if not isinstance(body, dict):
         return None, (HTTPStatus.BAD_REQUEST, "lobby op must be an object")
     op = body.get("op")
+    if op == "status":  # PC のいまの様子（PC だけ）
+        if not local:
+            return None, (HTTPStatus.FORBIDDEN, "PC only")
+        if not isinstance(body.get("status"), dict):
+            return None, (HTTPStatus.BAD_REQUEST, "status must be an object")
+        with _lobby_lock:
+            _live["status"] = body["status"]
+            _live["statusAt"] = _now_ms()
+            return lobby_view(load_lobby(data_dir), local), None
+    if op == "auth":  # スマホの管理者画面: 暗証番号の確認だけ
+        if not _pin_ok(data_dir, body.get("pin")):
+            return None, (HTTPStatus.FORBIDDEN, "wrong pin")
+        with _lobby_lock:
+            return lobby_view(load_lobby(data_dir), local), None
+    if op == "command":  # スマホからの操作（スタンバイ・スタート・中断・結果を閉じる・設定）
+        cmd = body.get("cmd")
+        if cmd not in COMMANDS:
+            return None, (HTTPStatus.BAD_REQUEST, "unknown command")
+        entry = {"cmd": cmd, "ts": _now_ms()}
+        if cmd == "settings":
+            if not _pin_ok(data_dir, body.get("pin")):
+                return None, (HTTPStatus.FORBIDDEN, "wrong pin")
+            patch = body.get("settings")
+            if not isinstance(patch, dict):
+                return None, (HTTPStatus.BAD_REQUEST, "settings must be an object")
+            # 暗証番号とマイクの選択はスマホからは変えない
+            entry["settings"] = {k: v for k, v in patch.items() if k not in ("adminPin", "deviceId")}
+        with _lobby_lock:
+            _live["seq"] += 1
+            entry["seq"] = _live["seq"]
+            _live["commands"] = (_live["commands"] + [entry])[-COMMAND_KEEP:]
+            return lobby_view(load_lobby(data_dir), local), None
     with _lobby_lock:
         lb = load_lobby(data_dir)
         if op == "add":
@@ -239,7 +300,7 @@ def lobby_op(data_dir, body, local):
             before = len(lb["queue"])
             lb["queue"] = [x for x in lb["queue"] if x.get("id") != body.get("id")]
             if len(lb["queue"]) == before:
-                return lb, None  # もう無い（別の画面が先に呼んだ）→ そのまま返す
+                return lobby_view(lb, local), None  # もう無い（別の画面が先に呼んだ）→ そのまま返す
         elif op == "edit":
             rid = body.get("recordId")
             hit = [x for x in lb["recent"] if x.get("recordId") == rid]
@@ -266,7 +327,7 @@ def lobby_op(data_dir, body, local):
             return None, (HTTPStatus.BAD_REQUEST, "unknown op")
         lb["rev"] += 1
         atomic_write_json(os.path.join(data_dir, "lobby.json"), lb)
-        return lb, None
+        return lobby_view(lb, local), None
 
 
 def phone_key(data_dir):
@@ -428,7 +489,7 @@ class Handler(SimpleHTTPRequestHandler):
                                         "lan": self.lan, "phoneKey": key, "phoneUrls": urls})
             if name == "lobby" and not rest:
                 with _lobby_lock:
-                    return self._send_json(load_lobby(self.data_dir))
+                    return self._send_json(lobby_view(load_lobby(self.data_dir), self._local()))
             if name == "records" and len(rest) == 1 and DATE_RE.match(rest[0]):
                 data = read_json(os.path.join(self.data_dir, "%s.json" % rest[0]), [])
                 return self._send_json(data if isinstance(data, list) else [])

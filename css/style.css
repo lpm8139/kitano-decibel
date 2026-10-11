@@ -196,6 +196,20 @@ button, input, select { font-family: inherit; }
 .stage[data-state='endless'] .stage-timer-fill { background: linear-gradient(90deg, #ff5a8a, #b14cff); }
 .stage-timer span { position: absolute; inset: 0; text-align: center; font-size: 28px; font-weight: 900; line-height: 44px; text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5); }
 
+/* いきおい（そくど）メーター */
+.speedo {
+  position: absolute; left: 24px; top: 22px; z-index: 6; padding: 8px 18px 10px; border-radius: 18px;
+  background: rgba(10, 14, 40, 0.62); border: 2px solid rgba(255, 255, 255, 0.18); min-width: 220px;
+}
+.speedo-k { font-size: 20px; color: #b9c0ff; font-weight: 900; }
+.speedo-v { font-size: 52px; font-weight: 900; line-height: 1; color: #fff; font-variant-numeric: tabular-nums; }
+.speedo-v small { margin-left: 6px; font-size: 20px; color: #d7dbff; }
+.speedo-bar { display: flex; gap: 5px; margin-top: 8px; }
+.speedo-bar i { flex: 1; height: 12px; border-radius: 4px; background: rgba(255, 255, 255, 0.15); transform: skewX(-20deg); }
+.speedo-bar i.on { background: linear-gradient(90deg, #4cd964, #ffd166); }
+.speedo-bar i.on.hot { background: linear-gradient(90deg, #ffd166, #ff5a5f); }
+.stage[data-state='endless'] .speedo { border-color: rgba(255, 122, 224, 0.6); }
+
 .endless-badge {
   position: absolute; right: 26px; top: 22px; padding: 8px 26px; border-radius: 999px; z-index: 5;
   background: linear-gradient(90deg, #ff5a8a, #b14cff); color: #fff; font-size: 34px; font-weight: 900; white-space: nowrap;
@@ -237,7 +251,7 @@ button, input, select { font-family: inherit; }
 .result-planet { position: absolute; left: -200px; bottom: -60px; }
 .result-rocket { position: absolute; left: 300px; top: 190px; }
 .result-rocket .flame, .result-rocket .flame-in { transform-box: fill-box; transform-origin: 50% 0; animation: flicker 0.12s infinite alternate; }
-.result-place { position: absolute; left: 520px; top: 220px; font-size: 56px; font-weight: 900; line-height: 1.25; text-shadow: 0 3px 10px rgba(0, 0, 0, 0.5); }
+.result-place { position: absolute; left: 520px; top: 220px; width: 400px; max-height: 150px; overflow: hidden; white-space: nowrap; font-size: 56px; font-weight: 900; line-height: 1.25; text-shadow: 0 3px 10px rgba(0, 0, 0, 0.5); }
 .result-badges { position: absolute; left: 520px; top: 430px; display: flex; gap: 22px; }
 .badge {
   width: 118px; height: 118px; border-radius: 50%; background: var(--yellow); color: #3a1f00; text-align: center; font-weight: 900;
@@ -306,8 +320,8 @@ button, input, select { font-family: inherit; }
 .cell { flex: 1; text-align: center; min-width: 0; }
 .cell:nth-child(2) { flex: 1.25; }
 .cell:empty, .cell[data-empty='1'] { display: none; }
-.cell-k { font-size: 24px; color: #b9c0ff; white-space: nowrap; }
-.cell-v { font-size: 52px; font-weight: 900; line-height: 1.15; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.cell-k { font-size: 24px; color: #b9c0ff; white-space: nowrap; overflow: hidden; }
+.cell-v { font-size: 52px; font-weight: 900; line-height: 1.15; white-space: nowrap; overflow: hidden; font-variant-numeric: tabular-nums; }
 
 /* ===== ランキング ===== */
 .rank-list { height: 100%; }

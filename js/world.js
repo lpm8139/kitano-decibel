@@ -5,9 +5,20 @@
 import { landmarksFor } from './game.js';
 import { avgRocketSvg, ghostRocketSvg, planetSvg, planetWidth, rocketSvg } from './art.js';
 
-/** 高さ → 世界座標(px)。√ にすると、低いところ（くも・うちゅう）も高いところ（どせい…）も間隔がほどよくそろう。 */
+/**
+ * 高さ(km) → 世界座標(px)。
+ *  ・つき（もくひょう2）まで: √ でちぢめる（くも・うちゅう・つき を1画面〜2画面に収める）
+ *  ・つきから先（エンドレス）: まっすぐ（1km = ENDLESS_PX_PER_KM px）。
+ *    √ のままだと上に行くほど画面の動きが遅くなり、エンドレスに入ったとたん「ゆっくり」に見えるため。
+ *    80dB で約 330px/秒 → ステージ1の平均と同じくらいの速さで星が流れていく。
+ */
 export const PX_SCALE = 60;
-export const worldY = (km) => PX_SCALE * Math.sqrt(Math.max(0, km));
+export const ENDLESS_PX_PER_KM = 2.6;
+export function worldYFor(km, moonKm) {
+  const k = Math.max(0, km);
+  if (k <= moonKm) return PX_SCALE * Math.sqrt(k);
+  return PX_SCALE * Math.sqrt(moonKm) + (k - moonKm) * ENDLESS_PX_PER_KM;
+}
 
 const GROUND_PAD = 110; // 地面（ロケットの足元）の画面下からの位置（.world の bottom と同じ）
 const ROCKET_BASE_FROM_TOP = 0.7; // 飛んでいる間、ロケットの足元をこの位置（画面の上からの割合）に保つ（上＝これから行く先を広く見せる）
@@ -53,6 +64,10 @@ export class WorldView {
     this.marks = [];
     this.goalEls = {};
     this.key = '';
+    this.moonKm = 500;
+    this.prevY = 0;
+    this.pxSpeed = 0;
+    this.speedlines = screen.querySelector('.speedlines');
     // ブースターの「スピード線」
     const lines = screen.querySelector('.speedlines');
     if (lines && !lines.childElementCount) {
@@ -72,6 +87,7 @@ export class WorldView {
     const key = `${settings.goal1Km}/${settings.goal2Km}`;
     if (key === this.key) return;
     this.key = key;
+    this.moonKm = settings.goal2Km;
     const marks = landmarksFor(settings);
     this.marks = marks;
     const w = this.world;
@@ -86,21 +102,21 @@ export class WorldView {
     };
 
     // 大気（地上〜うちゅう）と、くも
-    add(`<div class="atmos" style="height:${Math.round(worldY(settings.goal1Km) + 60)}px"></div>`, -GROUND_PAD);
-    const cloudY = worldY(10);
+    add(`<div class="atmos" style="height:${Math.round(this.y(settings.goal1Km) + 60)}px"></div>`, -GROUND_PAD);
+    const cloudY = this.y(10);
     add(`<div class="cloud" style="left:40px;width:150px;bottom:0"></div><div class="cloud" style="left:700px;width:180px;bottom:40px"></div><div class="cloud" style="left:460px;width:120px;bottom:-60px;opacity:.7"></div>`, cloudY - 20);
 
     // ちきゅう（足元の地平線）と発射台
     add(`<div class="earth" style="left:${470 - EARTH_D / 2}px;bottom:${-EARTH_D + 40}px">${earthHorizonSvg(EARTH_D)}</div><div class="pad" style="left:275px;bottom:14px"></div>`, 0);
 
     // 走路
-    add(`<div class="track" style="height:${Math.round(worldY(8000))}px"></div>`, 0);
+    add(`<div class="track" style="height:${Math.round(this.y(8000))}px"></div>`, 0);
 
     // 目印（線とラベル）と、星（左はしから半分だけ見える）
     this.goalEls = {};
     for (const m of marks) {
       if (m.key === 'earth') continue;
-      const y = worldY(m.km);
+      const y = this.y(m.km);
       if (m.planet) {
         const d = m.planet === 'moon' ? PLANET_D + 20 : PLANET_D;
         const pw = planetWidth(m.planet, d);
@@ -156,9 +172,22 @@ export class WorldView {
    * 毎フレーム呼ぶ。
    * @param {{alt:number, ghosts?:{champ?:number|null, avg?:number|null}, thrust:number, dt:number, snap?:boolean}} p
    */
-  update({ alt, ghosts = {}, thrust, dt, snap = false }) {
+  /** 高さ → 世界座標(px)。 */
+  y(km) {
+    return worldYFor(km, this.moonKm);
+  }
+
+  update({ alt, ghosts = {}, thrust, dt, snap = false, boosting = false }) {
     const H = this.screen.clientHeight || 722;
-    const youY = worldY(alt);
+    const youY = this.y(alt);
+    // 画面の上での速さ（px/秒）に合わせてスピード線を濃くする（速く飛ぶほど「勢い」が見える）
+    if (dt > 0 && !snap) this.pxSpeed += ((youY - this.prevY) / dt - this.pxSpeed) * Math.min(1, dt / 0.25);
+    if (snap) this.pxSpeed = 0;
+    this.prevY = youY;
+    if (this.speedlines) {
+      const o = boosting ? 1 : Math.max(0, Math.min(0.85, (this.pxSpeed - 120) / 350));
+      this.speedlines.style.opacity = o.toFixed(2);
+    }
     const target = cameraFor(youY, H);
     // カメラはなめらかに追いかける（いきなり飛ばない）。snap = 待機に戻ったときなどは即座に。
     const k = snap ? 1 : 1 - Math.exp(-dt / 0.12);
@@ -182,7 +211,7 @@ export class WorldView {
         continue;
       }
       g.el.hidden = false;
-      const gY = worldY(gAlt);
+      const gY = this.y(gAlt);
       g.el.style.transform = `translateY(${(-gY).toFixed(1)}px)`;
       // 画面の外にいるときは、上か下のはしに「チャンピオン ○km さき」を出す
       const base = H - GROUND_PAD - (gY - this.cam); // ゴーストの足元の画面Y

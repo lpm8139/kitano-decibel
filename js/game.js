@@ -6,6 +6,8 @@
 // 高さ: 1サンプルごとに max(0, dB - floor) × kmRate × 経過秒 だけ上昇（km はゲーム内の数字）
 
 export const BOOSTER_SEC = 3;
+/** ブースターのいちばん短い時間（秒）。 */
+export const BOOSTER_MIN_SEC = 1.2;
 /** サンプル間隔がこれより空いても、1回で加算する時間はここまで（タブの一時停止などで跳ねないように）。 */
 const MAX_STEP_SEC = 0.25;
 /** 高さの履歴を残す間隔（ms）。ゴースト再生と保存用。 */
@@ -116,7 +118,14 @@ export function thin(series, stepMs) {
   return out;
 }
 
-const easeOutCubic = (p) => 1 - (1 - p) ** 3;
+/**
+ * ブースターの進み方（0〜1 の割合）。いまの速さ v0（全体の距離を1としたときの、1回分の時間あたり）から始めて、
+ * だんだん速くなってつきに着く。最後に止まりかけると、そのあとのエンドレスが遅く見えるため。
+ */
+export const boostCurve = (p, v0) => {
+  const a = Math.min(Math.max(0, v0), 1);
+  return a * p + (1 - a) * p * p;
+};
 const round1 = (x) => Math.round(x * 10) / 10;
 
 /**
@@ -141,6 +150,7 @@ export class RocketRun {
     this.boosted = false;
     this.silence = 0;
     this.cheer = null; // ブースター中の会場の声（表示用。記録には入れない）
+    this.lastSpeed = 0;
     this.endReason = null;
   }
 
@@ -178,6 +188,8 @@ export class RocketRun {
       if (hasDb) {
         this.alt += altitudeGain(db, dt, this.s);
         this.voice.push([this.rel(t), round1(db)]);
+        // いまの速さ（km/秒）。1サンプルの大声・小声で決まらないよう、0.4秒くらいでならす
+        this.lastSpeed += (altitudeGain(db, 1, this.s) - this.lastSpeed) * Math.min(1, dt / 0.4);
       }
       this.checkGoals(events, false);
       if (this.reached.goal2) {
@@ -187,6 +199,12 @@ export class RocketRun {
           this.phase = 'booster';
           this.boostStart = t;
           this.boostFrom = this.alt;
+          // ブースター直前の速さ（km/秒）から始める（いきなり止まって見えないように）
+          // つきが近くて声も大きかった人は、3秒かけると遅く見えるので短くする（平均でいまの1.5倍の速さ以上）
+          const dist = this.s.goal2Km - this.alt;
+          const v0 = this.lastSpeed;
+          this.boostSec = v0 > 0 ? Math.min(BOOSTER_SEC, Math.max(BOOSTER_MIN_SEC, dist / (1.5 * v0))) : BOOSTER_SEC;
+          this.boostV0 = dist > 0 ? (v0 * this.boostSec) / dist : 1;
           this.boosted = true;
           events.push({ type: 'booster' });
         } else {
@@ -195,8 +213,8 @@ export class RocketRun {
       }
     } else if (this.phase === 'booster') {
       this.cheer = hasDb ? db : this.cheer;
-      const p = Math.min(1, (t - this.boostStart) / (BOOSTER_SEC * 1000));
-      this.alt = this.boostFrom + (this.s.goal2Km - this.boostFrom) * easeOutCubic(p);
+      const p = Math.min(1, (t - this.boostStart) / (this.boostSec * 1000));
+      this.alt = this.boostFrom + (this.s.goal2Km - this.boostFrom) * boostCurve(p, this.boostV0);
       this.checkGoals(events, true);
       if (p >= 1) {
         this.alt = Math.max(this.alt, this.s.goal2Km);

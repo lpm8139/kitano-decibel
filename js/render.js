@@ -41,6 +41,9 @@ export function createRenderer(doc = document) {
     stageTimerFill: $('stage-timer-fill'),
     stageTimerText: $('stage-timer-text'),
     endlessBadge: $('endless-badge'),
+    speedo: $('speedo'),
+    speedoNum: $('speedo-num'),
+    speedoBars: [...$('speedo-bar').querySelectorAll('i')],
     pop: $('pop'),
     goalCard: $('goal-card'),
     goalCardSub: $('goal-card-sub'),
@@ -81,6 +84,15 @@ export function createRenderer(doc = document) {
     el.classList.remove(cls);
     void el.offsetWidth;
     el.classList.add(cls);
+  };
+  /** 枠からはみ出す文字を、収まるまで小さくする（size は最初の大きさ）。 */
+  const fitText = (el, size, min = 18) => {
+    let s = size;
+    el.style.fontSize = `${s}px`;
+    while (s > min && el.scrollWidth > el.clientWidth + 1) {
+      s -= 2;
+      el.style.fontSize = `${s}px`;
+    }
   };
   const timers = new Map();
   /** 要素を ms だけ表示する。 */
@@ -140,13 +152,14 @@ export function createRenderer(doc = document) {
           return;
         }
         delete c.el.dataset.empty;
+        const sig = `${d.k}|${d.v}|${d.color}|${d.size}`;
+        if (c.key === sig) return; // 変わっていなければ何もしない（毎フレーム呼ばれる）
+        c.key = sig;
         setText(c.k, d.k);
         setText(c.v, d.v);
-        const style = `color:${d.color || '#fff'};font-size:${d.size || 52}px`;
-        if (c.key !== style) {
-          c.v.setAttribute('style', style);
-          c.key = style;
-        }
+        c.v.style.color = d.color || '#fff';
+        fitText(c.k, 24, 14);
+        fitText(c.v, d.size || 52);
       });
     },
     setMicStatus(text, kind = 'pending') {
@@ -200,6 +213,20 @@ export function createRenderer(doc = document) {
       els.stageTimer.hidden = false;
       els.stageTimerFill.style.width = `${(Math.min(1, Math.max(0, frac)) * 100).toFixed(1)}%`;
       setText(els.stageTimerText, text);
+    },
+    /** いきおいメーター（km/秒）。null で隠す。 */
+    setSpeed(kmps) {
+      if (kmps === null) {
+        els.speedo.hidden = true;
+        return;
+      }
+      els.speedo.hidden = false;
+      setText(els.speedoNum, String(Math.max(0, Math.round(kmps))));
+      const level = Math.min(5, Math.ceil(Math.max(0, kmps) / 40)); // 40km/秒ごとに1目盛り（200km/秒で満タン）
+      els.speedoBars.forEach((b, i) => {
+        b.classList.toggle('on', i < level);
+        b.classList.toggle('hot', i < level && level >= 4);
+      });
     },
     setEndlessBadge(on) {
       els.endlessBadge.hidden = !on;
@@ -282,6 +309,7 @@ export function createRenderer(doc = document) {
         bb.textContent = b;
         const sm = doc.createElement('small');
         sm.textContent = t;
+        if (t.length > 4) sm.style.fontSize = `${Math.max(13, 19 - (t.length - 4) * 2)}px`;
         el.append(bb, sm);
         els.resultBadges.append(el);
       }
@@ -289,6 +317,7 @@ export function createRenderer(doc = document) {
       els.stage.dataset.newrecord = isNewRecord ? '1' : '0';
       setText(els.scoreBig, km(score));
       els.resultView.hidden = false;
+      fitText(els.resultPlace, 56, 30); // 「たいようけいの はて」など長い場所名も枠に収める
     },
     /** しんきろくの演出（結果画面。部門があとから決まったときにも呼ぶ）。 */
     celebrate() {

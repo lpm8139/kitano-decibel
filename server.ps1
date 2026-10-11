@@ -247,10 +247,60 @@ function Save-Lobby {
 }
 
 # 戻り値: @{ status = 200 / 400 ...; message = ... }
+# スマホからの操作（PC が取りに来て実行する）と、PC のいまの様子。メモリだけに持つ（server.py と同じ）
+$Commands = @('standby', 'start', 'abort', 'close', 'settings')
+$script:LiveStatus = $null
+$script:LiveStatusAt = [long]0
+$script:CmdSeq = 0
+$script:CmdList = New-Object System.Collections.ArrayList
+$script:Boot = [string]([guid]::NewGuid().ToString('N').Substring(0, 8))  # サーバーを起動するたびに変わる
+
+function Get-AdminPin {
+  $st = Read-JsonFile (Join-Path $script:DataDirFull 'settings.json') $null
+  if ((Test-Dict $st) -and ($st['adminPin'] -is [string]) -and ($st['adminPin'] -match '^\d{4,8}$')) { return [string]$st['adminPin'] }
+  return '0000'
+}
+
+function Get-LobbyView([bool]$local) {
+  $lb = Get-Lobby
+  $v = @{ rev = [int]$lb['rev']; queue = $lb['queue']; recent = $lb['recent']; status = $script:LiveStatus;
+          statusAt = [long]$script:LiveStatusAt; cmdSeq = [int]$script:CmdSeq; boot = [string]$script:Boot }
+  if ($local) { $v['commands'] = $script:CmdList }
+  return $v
+}
+
 function Invoke-LobbyOp($body, [bool]$local) {
   if (-not (Test-Dict $body)) { return @{ status = 400; message = 'lobby op must be an object' } }
   $lb = Get-Lobby
   $op = [string]$body['op']
+  if ($op -eq 'status') {
+    if (-not $local) { return @{ status = 403; message = 'PC only' } }
+    if (-not (Test-Dict $body['status'])) { return @{ status = 400; message = 'status must be an object' } }
+    $script:LiveStatus = $body['status']
+    $script:LiveStatusAt = Get-NowMs
+    return @{ status = 200 }
+  }
+  if ($op -eq 'auth') {
+    if (-not ($body['pin'] -is [string]) -or -not ([string]$body['pin'] -ceq (Get-AdminPin))) { return @{ status = 403; message = 'wrong pin' } }
+    return @{ status = 200 }
+  }
+  if ($op -eq 'command') {
+    $cmd = [string]$body['cmd']
+    if (-not ($Commands -contains $cmd)) { return @{ status = 400; message = 'unknown command' } }
+    $entry = @{ cmd = $cmd; ts = (Get-NowMs) }
+    if ($cmd -eq 'settings') {
+      if (-not ($body['pin'] -is [string]) -or -not ([string]$body['pin'] -ceq (Get-AdminPin))) { return @{ status = 403; message = 'wrong pin' } }
+      if (-not (Test-Dict $body['settings'])) { return @{ status = 400; message = 'settings must be an object' } }
+      $patch = @{}
+      foreach ($k in @($body['settings'].Keys)) { if ($k -ne 'adminPin' -and $k -ne 'deviceId') { $patch[[string]$k] = $body['settings'][$k] } }
+      $entry['settings'] = $patch
+    }
+    $script:CmdSeq = [int]$script:CmdSeq + 1
+    $entry['seq'] = [int]$script:CmdSeq
+    [void]$script:CmdList.Add($entry)
+    while ($script:CmdList.Count -gt 20) { $script:CmdList.RemoveAt(0) }
+    return @{ status = 200 }
+  }
   if ($op -eq 'add') {
     $name = Get-CleanName $body['name']; $div = Get-CleanDiv $body['division']
     if (-not $name -and -not $div) { return @{ status = 400; message = 'name or division required' } }
@@ -435,13 +485,13 @@ function Invoke-Request($ctx) {
   if (-not $local -and -not ($name -eq 'lobby' -and (Test-KeyOk $ctx))) { [void](Read-BodyText $ctx); Send-Error $ctx 403 'forbidden'; return }
 
   if ($name -eq 'lobby' -and $rest.Count -eq 0) {
-    if ($method -eq 'GET') { Send-JsonText $ctx (ConvertTo-JsonText (Get-Lobby)); return }
+    if ($method -eq 'GET') { Send-JsonText $ctx (ConvertTo-JsonText (Get-LobbyView $local)); return }
     if ($method -eq 'POST') {
       $bodyText = Read-BodyText $ctx
       try { $body = ConvertFrom-Body $bodyText } catch { Send-Error $ctx 400 'invalid json'; return }
       $res = Invoke-LobbyOp $body $local
       if ($res['status'] -ne 200) { Send-Error $ctx ([int]$res['status']) ([string]$res['message']); return }
-      Send-JsonText $ctx (ConvertTo-JsonText (Get-Lobby)); return
+      Send-JsonText $ctx (ConvertTo-JsonText (Get-LobbyView $local)); return
     }
   }
 

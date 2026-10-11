@@ -58,6 +58,36 @@
     .keybox { display: none; }
     .keybox.on { display: block; }
     .note { font-size: 12px; color: var(--sub); margin-top: 8px; line-height: 1.6; }
+    /* PC のそうさ */
+    .pc-state { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .pc-badge { padding: 4px 12px; border-radius: 999px; background: #e3e8f0; font-weight: 900; font-size: 16px; white-space: nowrap; }
+    .pc-badge[data-s=standby] { background: #fff1c2; }
+    .pc-badge[data-s=stage1], .pc-badge[data-s=booster], .pc-badge[data-s=endless] { background: #ffd8c2; color: #b33a00; }
+    .pc-badge[data-s=result] { background: #d4f7df; color: #1e6b3a; }
+    .pc-badge[data-s=off] { background: #ffe3e3; color: #c0392b; }
+    .pc-who { flex: 1; min-width: 0; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pc-db { font-size: 14px; color: var(--sub); white-space: nowrap; }
+    .ctrl { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; }
+    .ctrl button { padding: 16px 6px; border: 0; border-radius: 14px; font-size: 19px; font-weight: 900; }
+    .ctrl .go { background: #1e8e4a; color: #fff; }
+    .ctrl .go.start { background: var(--orange); }
+    .ctrl .stop { background: #ffe3e3; color: #c0392b; }
+    .ctrl .close { grid-column: 1 / 3; background: #e3e8f0; color: var(--navy); }
+    .ctrl button:disabled { opacity: 0.35; }
+    .busy { margin-top: 8px; font-size: 13px; color: #c0392b; }
+    /* 設定 */
+    details summary { font-size: 17px; font-weight: 700; cursor: pointer; }
+    .pinrow { display: flex; gap: 8px; margin-top: 10px; }
+    .pinrow input { font-size: 20px; letter-spacing: 6px; text-align: center; }
+    .set-group { margin-top: 14px; font-size: 13px; font-weight: 700; color: var(--sub); border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+    .set-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid #f0f3f8; }
+    .set-row label { font-size: 15px; }
+    .set-row label small { display: block; font-size: 11px; color: var(--sub); }
+    .set-row input[type=number] { width: 90px; padding: 6px 8px; border: 2px solid var(--line); border-radius: 10px; font-size: 17px; text-align: right; }
+    .set-row input[type=range] { width: 130px; }
+    .set-row select { padding: 6px; font-size: 15px; border-radius: 10px; border: 2px solid var(--line); }
+    .set-row input[type=checkbox] { width: 26px; height: 26px; }
+    .live-db { font-size: 15px; padding: 8px 10px; margin-top: 10px; border-radius: 10px; background: #eef3ff; }
   </style>
 </head>
 <body>
@@ -70,6 +100,21 @@
       <h2>合言葉を入れてください</h2>
       <input id="key" type="text" inputmode="text" autocomplete="off" autocapitalize="off" placeholder="PC の管理者画面に出ています">
       <button id="key-save" class="primary" type="button">つなぐ</button>
+    </section>
+
+    <section>
+      <h2>PC の そうさ</h2>
+      <div class="pc-state">
+        <span id="pc-badge" class="pc-badge" data-s="off">つながっていない</span>
+        <span id="pc-who" class="pc-who"></span>
+        <span id="pc-db" class="pc-db"></span>
+      </div>
+      <div class="ctrl">
+        <button id="btn-go" class="go" type="button" disabled>スタンバイ</button>
+        <button id="btn-stop" class="stop" type="button" disabled>ちゅうだん</button>
+        <button id="btn-close" class="close" type="button" disabled>けっかを とじる（つぎの人を まつ）</button>
+      </div>
+      <div id="pc-busy" class="busy" hidden>PC で管理者画面などが開いています。PC で閉じてください。</div>
     </section>
 
     <section>
@@ -95,13 +140,33 @@
       <h2>さいきんの けっか <small>なまえ・ぶもんを あとから なおせます</small></h2>
       <div id="recent"></div>
     </section>
+
+    <section>
+      <details id="admin">
+        <summary>せってい（スタッフ用・暗証番号）</summary>
+        <div id="admin-lock">
+          <div class="pinrow">
+            <input id="pin" type="password" inputmode="numeric" maxlength="8" autocomplete="off" placeholder="暗証番号">
+            <button id="pin-ok" class="sub-btn save" type="button">ひらく</button>
+          </div>
+          <div id="pin-msg" class="saved"></div>
+        </div>
+        <div id="admin-body" hidden>
+          <div id="live-db" class="live-db">いまの こえ: --</div>
+          <div id="set-form"></div>
+          <button id="set-save" class="primary" type="button">ほぞんして PC に はんえい</button>
+          <div id="set-msg" class="saved"></div>
+          <div class="note">マイクの選び直し・暗証番号の変更・記録のリセットは PC の管理者画面で。飛んでいる最中に変えた設定は、つぎの人から使われます。</div>
+        </div>
+      </details>
+    </section>
   </main>
   <div id="toast" class="toast" role="status"></div>
 
   <script>
     'use strict';
     // ---- 設定 ----
-    var POLL_MS = 1000;
+    var POLL_MS = 500;
     var KEY_STORE = 'kitano-decibel:phone-key';
     var DIV = { k: 'ようちえん', low: '1〜3ねんせい', high: '4〜6ねんせい', adult: 'おとな' };
     var PLACE = { earth: 'ちきゅう', cloud: 'くも', space: 'うちゅう', moon: 'つき', mars: 'かせい', jupiter: 'もくせい', saturn: 'どせい',
@@ -158,9 +223,12 @@
       }).then(function (res) {
         clearTimeout(timer);
         if (res.status === 403) {
-          setConn(false, '合言葉がちがいます');
-          $('keybox').classList.add('on');
-          throw new Error('forbidden');
+          return res.json().catch(function () { return {}; }).then(function (j) {
+            if (j && j.error === 'wrong pin') throw new Error('wrong pin'); // 暗証番号ちがい（合言葉は合っている）
+            setConn(false, '合言葉がちがいます');
+            $('keybox').classList.add('on');
+            throw new Error('forbidden');
+          });
         }
         if (!res.ok) throw new Error('HTTP ' + res.status);
         return res.json();
@@ -170,7 +238,7 @@
         return lb;
       }, function (e) {
         clearTimeout(timer);
-        if (e.message !== 'forbidden') setConn(false);
+        if (e.message !== 'forbidden' && e.message !== 'wrong pin') setConn(false);
         throw e;
       });
     }
@@ -182,6 +250,140 @@
     setInterval(poll, POLL_MS);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) poll(); });
     poll();
+
+    // ---- PC のそうさ ----
+    var STATE = { idle: 'たいき', standby: 'スタンバイ', stage1: 'とんでいる', booster: 'ブースター', endless: 'エンドレス', result: 'けっか' };
+    var pc = null;
+    var lock = null; // ボタンを押したあと、PC の状態が変わるまで（最大 2.5 秒）ボタンを止めておく
+    var lastStatusAt = 0;
+    var lastStatusSeen = 0;
+    function renderStatus(st, at) {
+      if (at !== lastStatusAt) { lastStatusAt = at; lastStatusSeen = Date.now(); }
+      var alive = st && Date.now() - lastStatusSeen < 4000; // PC が 1 秒ごとに知らせてくる。4 秒来なければ止まっている
+      pc = alive ? st : null;
+      var badge = $('pc-badge');
+      badge.dataset.s = alive ? st.state : 'off';
+      badge.textContent = alive ? (STATE[st.state] || st.state) : 'PC が うごいていない';
+      var who = '';
+      if (alive) {
+        var p = st.state === 'result' ? st.result : (st.player || st.next);
+        if (p) who = (st.state === 'idle' ? 'つぎ: ' : '') + (p.name || 'ななし') + (p.division ? '（' + DIV[p.division] + '）' : '');
+        if (st.state === 'result' && st.result) who += ' ' + Math.round(st.result.score).toLocaleString('ja-JP') + 'km';
+      }
+      $('pc-who').textContent = who;
+      $('pc-db').textContent = alive && st.db !== null ? st.db.toFixed(1) + ' dB' : '';
+      var s = alive ? st.state : '';
+      var running = s === 'stage1' || s === 'booster' || s === 'endless';
+      if (lock && (s !== lock.state || Date.now() > lock.until)) lock = null;
+      var locked = !!lock;
+      var go = $('btn-go');
+      go.disabled = locked || !alive || st.busy || running;
+      go.textContent = s === 'standby' ? 'いますぐ スタート' : s === 'result' ? 'つぎの人 スタンバイ' : 'スタンバイ';
+      go.classList.toggle('start', s === 'standby');
+      $('btn-stop').disabled = locked || !alive || st.busy || !(running || s === 'standby');
+      $('btn-close').disabled = locked || !alive || st.busy || s !== 'result';
+      $('pc-busy').hidden = !(alive && st.busy);
+      if (alive) {
+        $('live-db').textContent = 'いまの こえ: ' + (st.db === null ? '--' : st.db.toFixed(1) + ' dB') + (st.micOk ? '' : '（マイクが使えません）');
+        if (adminOpen && !formDirty) fillForm(st.settings);
+      }
+    }
+    function command(cmd, label) {
+      // 押したボタンは、PC の様子が変わるまで押せないようにする（2回押し・古い表示での押しまちがい防止）
+      lock = { state: pc ? pc.state : '', until: Date.now() + 2500 };
+      ['btn-go', 'btn-stop', 'btn-close'].forEach(function (id) { $(id).disabled = true; });
+      return api({ op: 'command', cmd: cmd }).then(function () { toast(label); }, function () { toast('おくれませんでした'); });
+    }
+    $('btn-go').addEventListener('click', function () {
+      var s = pc && pc.state;
+      command(s === 'standby' ? 'start' : 'standby', s === 'standby' ? 'スタート！' : 'スタンバイ');
+    });
+    $('btn-stop').addEventListener('click', function () { command('abort', 'ちゅうだん しました'); });
+    $('btn-close').addEventListener('click', function () { command('close', 'けっかを とじました'); });
+
+    // ---- 設定（暗証番号） ----
+    var adminOpen = false;
+    var formDirty = false;
+    var adminPin = '';
+    var FIELDS = [
+      ['ゲーム'],
+      ['nameInput', 'bool', 'なまえ入力', '登録ずみの人は とばす'],
+      ['booster', 'bool', 'ブースター（つきまでワープ）'],
+      ['cheerBoost', 'bool', 'おうえんメーター'],
+      ['divisions', 'bool', 'ぶもんわけ'],
+      ['ghost', 'bool', 'チャンピオン ゴースト'],
+      ['ghostAvg', 'bool', 'へいきん ゴースト'],
+      ['stage1Sec', 'num', 'ステージ1（びょう）', '', 3, 10, 1],
+      ['endlessMaxSec', 'num', 'エンドレス さいちょう（びょう）', '', 3, 30, 1],
+      ['silenceEndSec', 'num', 'こえが とぎれたら おわり（びょう）', '', 0.3, 3, 0.1],
+      ['むずかしさ'],
+      ['kmRate', 'num', 'のびやすさ', 'km/びょう/dB', 0.5, 50, 0.5],
+      ['floor', 'num', 'のびはじめ', 'dB', 0, 120, 1],
+      ['goal1Km', 'num', 'もくひょう1 うちゅう', 'km', 10, 780, 1],
+      ['goal2Km', 'num', 'もくひょう2 つき', 'km', 20, 790, 1],
+      ['マイク'],
+      ['threshold', 'num', 'はっしゃ する こえ', 'dB', 0, 140, 1],
+      ['offset', 'num', 'こうせい オフセット', 'dB', -100, 200, 0.5],
+      ['おと・がめん'],
+      ['bgm', 'bool', 'BGM'],
+      ['bgmVolume', 'range', 'BGM の おおきさ'],
+      ['muteBgmDuringRun', 'bool', 'けいそく中は BGM を けす'],
+      ['se', 'bool', 'こうかおん'],
+      ['seVolume', 'range', 'こうかおん の おおきさ'],
+      ['seDuringRun', 'bool', 'けいそく中も こうかおん'],
+      ['theme', 'theme', 'はいけい'],
+      ['rehearsal', 'bool', 'リハーサル', 'ランキングに いれない'],
+    ];
+    var inputs = {};
+    (function buildForm() {
+      var box = $('set-form');
+      FIELDS.forEach(function (f) {
+        if (f.length === 1) { box.appendChild(el('div', 'set-group', f[0])); return; }
+        var row = el('div', 'set-row');
+        var lab = el('label', '', f[2]);
+        if (f[3]) lab.appendChild(el('small', '', f[3]));
+        var inp;
+        if (f[1] === 'bool') { inp = el('input'); inp.type = 'checkbox'; }
+        else if (f[1] === 'num') { inp = el('input'); inp.type = 'number'; inp.min = f[4]; inp.max = f[5]; inp.step = f[6]; inp.inputMode = 'decimal'; }
+        else if (f[1] === 'range') { inp = el('input'); inp.type = 'range'; inp.min = 0; inp.max = 1; inp.step = 0.05; }
+        else { inp = el('select'); [['light', 'あかるい'], ['dark', 'くらい（うちゅう）']].forEach(function (o) { var op = el('option', '', o[1]); op.value = o[0]; inp.appendChild(op); }); }
+        inp.addEventListener('input', function () { formDirty = true; $('set-msg').textContent = ''; });
+        inp.addEventListener('change', function () { formDirty = true; });
+        inputs[f[0]] = { el: inp, type: f[1] };
+        row.appendChild(lab); row.appendChild(inp);
+        box.appendChild(row);
+      });
+    })();
+    function fillForm(st) {
+      if (!st) return;
+      Object.keys(inputs).forEach(function (k) {
+        var i = inputs[k];
+        if (st[k] === undefined) return;
+        if (i.type === 'bool') i.el.checked = !!st[k]; else i.el.value = st[k];
+      });
+    }
+    function readForm() {
+      var out = {};
+      Object.keys(inputs).forEach(function (k) {
+        var i = inputs[k];
+        out[k] = i.type === 'bool' ? i.el.checked : i.type === 'theme' ? i.el.value : Number(i.el.value);
+      });
+      return out;
+    }
+    $('pin-ok').addEventListener('click', function () {
+      var pin = $('pin').value.trim();
+      api({ op: 'auth', pin: pin }).then(function () {
+        adminPin = pin; adminOpen = true; formDirty = false;
+        $('admin-lock').hidden = true; $('admin-body').hidden = false;
+        if (pc) fillForm(pc.settings);
+      }, function () { $('pin-msg').textContent = '暗証番号が ちがいます'; });
+    });
+    $('set-save').addEventListener('click', function () {
+      api({ op: 'command', cmd: 'settings', pin: adminPin, settings: readForm() }).then(function () {
+        formDirty = false;
+        $('set-msg').textContent = 'PC に おくりました ✓（1 びょうほどで はんえい）';
+      }, function () { $('set-msg').textContent = 'おくれませんでした（暗証番号が かわった？）'; });
+    });
 
     // ---- 登録 ----
     function updateAddButton() {
@@ -222,6 +424,7 @@
     }
 
     function accept(lb) {
+      if (lb && lb.status !== undefined) renderStatus(lb.status, lb.statusAt);
       if (!lb || !Array.isArray(lb.queue) || lb.rev === lobby.rev) return;
       lobby = { rev: lb.rev, queue: lb.queue, recent: Array.isArray(lb.recent) ? lb.recent : [] };
       renderQueue();

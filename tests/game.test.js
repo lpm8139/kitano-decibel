@@ -174,3 +174,40 @@ test('averageSeries: 時刻ごとの平均。先に飛び終わった人は最�
   const one = averageSeries([a], 250);
   for (const [t, v] of one) assert.equal(v, Math.round(altitudeAt(a, t)));
 });
+
+test('worldYFor: つきまでは√、つきから先はまっすぐ（エンドレスで画面の動きが遅くならない）', async () => {
+  const { worldYFor, ENDLESS_PX_PER_KM, PX_SCALE } = await import('../js/world.js');
+  const moon = 500;
+  assert.equal(worldYFor(0, moon), 0);
+  assert.equal(worldYFor(100, moon), PX_SCALE * 10);
+  const ym = worldYFor(moon, moon);
+  assert.ok(Math.abs(worldYFor(moon + 1e-9, moon) - ym) < 1e-6, 'つきでつながっている');
+  assert.ok(Math.abs(worldYFor(800, moon) - (ym + 300 * ENDLESS_PX_PER_KM)) < 1e-9);
+  // エンドレスの画面の速さ（px/km）は、つき直前の √ の速さより速い
+  const slopeBefore = worldYFor(moon, moon) - worldYFor(moon - 1, moon);
+  assert.ok(ENDLESS_PX_PER_KM > slopeBefore * 1.5, `${ENDLESS_PX_PER_KM} vs ${slopeBefore}`);
+  for (let k = 0; k < 3000; k += 50) assert.ok(worldYFor(k + 50, moon) > worldYFor(k, moon));
+});
+
+test('ブースターはいまの速さから始まって、だんだん速くなり、そのままエンドレスへ（途中で止まりかけない）', () => {
+  const run = new RocketRun(S);
+  run.start(0, 60);
+  for (let t = 50; t <= 5000; t += 50) run.update(t, 60);
+  assert.equal(run.phase, 'booster');
+  const at = (sec) => {
+    run.update(5000 + sec * 1000, null);
+    return run.alt;
+  };
+  const a = [0, 0.5, 1, 1.5, 2, 2.5, 2.95].map(at);
+  const gains = a.slice(1).map((x, i) => x - a[i]);
+  for (let i = 1; i < gains.length - 1; i++) assert.ok(gains[i] > gains[i - 1], `前半より後半が速い ${gains}`);
+  assert.ok(gains[0] / 0.5 >= 25 * 0.9, `はじめの速さ ${gains[0] / 0.5}km/秒（60dB=25km/秒 から）`);
+});
+
+test('boostCurve: 0→1、はじめの傾きが v0、速すぎるときはまっすぐ', async () => {
+  const { boostCurve } = await import('../js/game.js');
+  assert.equal(boostCurve(0, 0.3), 0);
+  assert.equal(boostCurve(1, 0.3), 1);
+  assert.ok(Math.abs(boostCurve(0.001, 0.3) / 0.001 - 0.3) < 0.01);
+  assert.equal(boostCurve(0.5, 5), 0.5);
+});

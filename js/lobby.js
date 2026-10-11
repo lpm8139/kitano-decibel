@@ -2,12 +2,14 @@
 // 受付（スマホで登録した順番待ち・最近の結果）を保存サーバーと同期する。PC 側から使う。
 // サーバーの /api/lobby を 1 秒ごとに見に行き、変わったら onChange(lobby) を呼ぶ。
 
-const POLL_MS = 1000;
+const POLL_MS = 500; // スマホからの操作（スタンバイ・スタートなど）をすぐ実行できるよう、短めに見に行く
 const TIMEOUT_MS = 4000;
 
 export class LobbyClient {
-  constructor({ onChange = () => {}, fetchImpl } = {}) {
+  constructor({ onChange = () => {}, onCommands = () => {}, fetchImpl } = {}) {
     this.onChange = onChange;
+    this.onCommands = onCommands;
+    this.cmdSeq = null; // 最後に受け取った操作の番号（最初の1回は「いままでの分」として読みとばす）
     this.fetch = fetchImpl ?? ((...a) => globalThis.fetch(...a));
     this.lobby = { rev: -1, queue: [], recent: [] };
     this.timer = null;
@@ -37,6 +39,18 @@ export class LobbyClient {
 
   accept(lb) {
     if (!lb || typeof lb !== 'object' || !Array.isArray(lb.queue)) return;
+    // スマホからの操作（PC だけに届く）。起動前に積まれていた古い操作は実行しない
+    // （通信の行き違いで古い応答があとから届いても、同じ操作を2回実行しない）
+    if (Number.isFinite(lb.cmdSeq)) {
+      if (this.cmdSeq === null || lb.boot !== this.boot) {
+        this.cmdSeq = lb.cmdSeq; // 初回、またはサーバーが再起動した（番号が振り直される）
+        this.boot = lb.boot;
+      } else if (lb.cmdSeq > this.cmdSeq) {
+        const fresh = (lb.commands ?? []).filter((c) => c.seq > this.cmdSeq).sort((a, b) => a.seq - b.seq);
+        this.cmdSeq = lb.cmdSeq;
+        if (fresh.length) this.onCommands(fresh);
+      }
+    }
     if (lb.rev === this.lobby.rev) return;
     this.lobby = { rev: lb.rev, queue: lb.queue, recent: Array.isArray(lb.recent) ? lb.recent : [] };
     this.onChange(this.lobby);
@@ -72,6 +86,11 @@ export class LobbyClient {
 
   clear() {
     return this.request({ op: 'clear' });
+  }
+
+  /** PC のいまの様子をスマホに見せる。 */
+  pushStatus(status) {
+    return this.request({ op: 'status', status }).catch(() => {});
   }
 
   /** 結果をスマホに見せる（スマホから名前・部門を後から付けられる）。 */

@@ -225,6 +225,8 @@ def fly(p, manual=False):
         time.sleep(0.1)
     wait_state(p, "result", 10)
     seen["cells"] = p.evaluate("[0,1,2].map(i => document.querySelector('#cell-' + i + ' .cell-v').textContent)")
+    over = p.evaluate("""[...document.querySelectorAll('.cell-v, .cell-k, #result-place')].filter(e => e.offsetParent && e.scrollWidth > e.clientWidth + 1).map(e => e.textContent)""")
+    check(not over, f"結果の文字がはみ出している: {over}")
     seen["newRecord"] = p.is_visible("#newrecord-pill")
     seen["side"] = p.evaluate("document.getElementById('stage').dataset.side")
     return seen
@@ -341,7 +343,8 @@ def s3_booster(env):
     r = records(env, p)[0]
     check(near(r["score"], 1250, 20) and r["boosted"] is True and r["reached"] == "jupiter", f"{r['score']} {r['boosted']} {r['reached']}")
     voice_t = [t for t, _ in r["series"]]
-    check(not any(5100 < t < 7900 for t in voice_t), "ブースター中の声が記録に入っている")
+    # ブースターは 1.2〜3 秒（つきまでの残りと、いまの速さで決まる）。少なくともその間の声は記録しない
+    check(not any(5100 < t < 6100 for t in voice_t), "ブースター中の声が記録に入っている")
     return f"{r['score']}km・ブースターあり・もくせい"
 
 
@@ -732,7 +735,8 @@ def s21_divisions(env):
     check(g["avg"] and g["champ"] and "1〜3ねん" in g["champLabel"] and "へいきん" in g["avgLabel"], f"ゴースト: {g}")
     wait_state(q, "result", 30)
     cells = q.evaluate("[0,1,2].map(i => document.querySelector('#cell-' + i + ' .cell-v').textContent)")
-    check(cells[2] == "1〜3ねん 1 い" and q.is_visible("#newrecord-pill"), f"結果: {cells}")
+    key = q.text_content("#cell-2 .cell-k")
+    check(cells[2] == "1 い" and "1〜3ねん" in key and q.is_visible("#newrecord-pill"), f"結果: {key} {cells}")
     name_and_close(q, "D")
     # ようちえん: 記録が無いのでゴーストなし・その部門で 1 い
     q.keyboard.press("Digit1")
@@ -743,11 +747,11 @@ def s21_divisions(env):
     check(none, "記録の無い部門でゴーストが出た")
     wait_state(q, "result", 30)
     name_and_close(q, "E")
-    # 部門を選ばずに飛ぶ → 結果で「ぶもんを えらんでね」→ 4 キーで おとな
+    # 部門を選ばずに飛ぶ → 結果で「ぶもんは？」→ 4 キーで おとな
     seen = fly(q)
-    check(seen["cells"][2] == "ぶもんを えらんでね", f"部門なしの結果: {seen['cells']}")
+    check(seen["cells"][2] == "ぶもんは？", f"部門なしの結果: {seen['cells']}")
     q.keyboard.press("Digit4")
-    q.wait_for_function("document.querySelector('#cell-2 .cell-v').textContent === 'おとな 1 い'", timeout=3000)
+    q.wait_for_function("document.querySelector('#cell-2 .cell-v').textContent === '1 い' && document.querySelector('#cell-2 .cell-k').textContent.includes('おとな')", timeout=3000)
     name_and_close(q, "F")
     rs = records(env, q)
     divs = {r["name"]: r.get("division") for r in rs}
@@ -791,13 +795,13 @@ def s22_phone(env):
     wait_state(p, "idle", 5)
     check("はると" in p.text_content("#strip"), "中断した人が先頭に戻らない")
     seen = fly(p)
-    check(seen["cells"][2] == "1〜3ねん 1 い", f"結果: {seen['cells']}")
-    check(p.input_value("#result-name") == "はると", "名前が入っていない")
+    check(seen["cells"][2] == "1 い" and "1〜3ねん" in p.text_content("#cell-2 .cell-k"), f"結果: {seen['cells']}")
+    check(seen["side"] == "score" and "はると" in p.text_content("#side-title"), f"登録ずみなのに名前を聞いた: {seen['side']} {p.text_content('#side-title')}")
     ph.wait_for_function("document.querySelectorAll('#queue li .qn').length === 1", timeout=5000)
     ph.wait_for_selector(".res.latest", timeout=5000)
     ph.fill(".res.latest input[type=text]", "はるとくん")
     ph.click(".res.latest .save")
-    p.wait_for_function("document.getElementById('result-name').value === 'はるとくん'", timeout=5000)
+    p.wait_for_function("window.__kitano.records.some(r => r.name === 'はるとくん')", timeout=5000)
     p.keyboard.press("Enter")
     wait_state(p, "idle")
     wait_saved(p)
@@ -815,6 +819,62 @@ def s22_phone(env):
     check(code == 403, f"LAN から記録が見えた: {code}")
     check(not ph.errors, f"スマホ画面のエラー: {ph.errors}")
     return "登録→呼び出し→中断で先頭へ→名前つきで記録→スマホで名前・部門を修正"
+
+
+def s23_phone_control(env):
+    """スマホから操作: スタンバイ → スタート → 中断、もう一度飛んで結果を閉じる、暗証番号つきで設定を変える"""
+    env.fresh({"endlessMaxSec": 3, "adminPin": "2468"})
+    url = phone_url(env)
+    p = env.page("silence")  # 無音なので、スマホの「スタート」でしか飛ばない
+    m = env.browser("silence").new_context(viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True)
+    env.contexts.append(m)
+    ph = m.new_page()
+    ph.errors = []
+    ph.on("pageerror", lambda e: ph.errors.append(str(e)))
+    ph.goto(url)
+    ph.wait_for_function("document.getElementById('pc-badge').dataset.s === 'idle'", timeout=10000)
+    t0 = time.time()
+    ph.click("#btn-go")  # スタンバイ
+    wait_state(p, "standby", 5)
+    lag = time.time() - t0
+    ph.wait_for_function("document.getElementById('btn-go').textContent.includes('スタート')", timeout=5000)
+    ph.click("#btn-go")  # いますぐスタート
+    wait_state(p, RUN_STATES, 5)
+    ph.wait_for_function("!document.getElementById('btn-stop').disabled", timeout=5000)
+    ph.click("#btn-stop")
+    wait_state(p, "idle", 5)
+    check(records(env, p, include_deleted=True) == [], "中断したのに記録が残った")
+    ph.wait_for_function("document.getElementById('pc-badge').dataset.s === 'idle' && !document.getElementById('btn-go').disabled", timeout=5000)
+    # もう一度（無音なので、ブースター→エンドレスを声のとぎれで終わる）
+    ph.click("#btn-go")
+    wait_state(p, "standby", 5)
+    ph.wait_for_function("document.getElementById('btn-go').textContent.includes('スタート')", timeout=5000)
+    ph.click("#btn-go")
+    wait_state(p, "result", 30)
+    ph.wait_for_function("!document.getElementById('btn-close').disabled", timeout=5000)
+    ph.click("#btn-close")
+    wait_state(p, "idle", 5)
+    wait_saved(p)
+    check(len(records(env, p)) == 1, "記録が1件にならない")
+    # 設定（暗証番号）
+    ph.click("#admin summary")
+    ph.fill("#pin", "0000")
+    ph.click("#pin-ok")
+    ph.wait_for_function("document.getElementById('pin-msg').textContent.includes('ちがいます')", timeout=5000)
+    check(not ph.is_visible("#keybox"), "暗証番号ちがいで合言葉の入力が出た")
+    ph.fill("#pin", "2468")
+    ph.click("#pin-ok")
+    ph.wait_for_selector("#admin-body:not([hidden])", timeout=5000)
+    ph.wait_for_function("document.querySelector('#set-form input[type=number]').value !== ''", timeout=5000)
+    km = ph.locator("#set-form input[type=number]").nth(3)  # のびやすさ（ステージ1・エンドレス・とぎれ の次）
+    km.fill("7.5")
+    ph.click("#set-save")
+    p.wait_for_function("window.__kitano.settings.kmRate === 7.5", timeout=5000)
+    wait_saved(p)
+    s = api(env.base, "/api/settings")
+    check(s["kmRate"] == 7.5 and s["adminPin"] == "2468", f"ファイルの設定: {s}")
+    check(not ph.errors, f"スマホ画面のエラー: {ph.errors}")
+    return f"スマホの操作が PC に届くまで {lag:.1f}s・中断・結果を閉じる・設定の変更 OK"
 
 
 SCENARIOS = [
@@ -840,6 +900,7 @@ SCENARIOS = [
     ("S20", "BGM の自動停止", s20_bgm),
     ("S21", "部門とへいきんゴースト", s21_divisions),
     ("S22", "スマホ受付", s22_phone),
+    ("S23", "スマホから操作・設定", s23_phone_control),
 ]
 
 
