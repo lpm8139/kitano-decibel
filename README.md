@@ -1,4 +1,4 @@
-# ロケット かんせいしつ（きたのにほんいち・声の大きさゲーム）
+# ロケット かんせいしつ（北の見本市・声の大きさゲーム）
 
 > **はじめての人は → [つかいかたガイド（docs/GUIDE.md）](docs/GUIDE.md)** ／ 当日のトラブルは → [トラブルとりせつ（docs/TROUBLESHOOTING.md）](docs/TROUBLESHOOTING.md)
 
